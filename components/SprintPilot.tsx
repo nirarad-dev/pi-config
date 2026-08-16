@@ -103,12 +103,12 @@ function preferredEffort(levels: Record<string, string[]>, model: ModelEntry) {
   return supported.includes(DEFAULT_EFFORT) ? DEFAULT_EFFORT : supported[0];
 }
 
-function RateLimitBadge({ label, limits }: { label: string; limits?: ProviderRateLimits }) {
+function RateLimitBadge({ label, limits, showFiveHour = true }: { label: string; limits?: ProviderRateLimits; showFiveHour?: boolean }) {
   const percentage = (value?: number) => value === undefined ? "—" : `${Math.round(value)}%`;
   const reset = (value?: string) => value ? new Date(value).toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" }) : "No reset data";
-  return <span className={styles.claudeUsageBadge}>
+  return <span className={`${styles.claudeUsageBadge} ${showFiveHour ? "" : styles.rateLimitWeeklyOnly}`}>
     <b>{label}</b>
-    <span title={`Resets ${reset(limits?.fiveHour?.resetsAt)}`}><small>5H</small><strong>{percentage(limits?.fiveHour?.usedPercentage)}</strong></span>
+    {showFiveHour && <span title={`Resets ${reset(limits?.fiveHour?.resetsAt)}`}><small>5H</small><strong>{percentage(limits?.fiveHour?.usedPercentage)}</strong></span>}
     <span title={`Resets ${reset(limits?.weekly?.resetsAt)}`}><small>WEEK</small><strong>{percentage(limits?.weekly?.usedPercentage)}</strong></span>
   </span>;
 }
@@ -818,13 +818,13 @@ export function SprintPilot() {
     <header className={styles.topbar}>
       <div className={styles.brand}><span className={styles.mark}>π</span><div><strong>SPRINTPILOT</strong><small>CONTROL PLANE</small></div></div>
       <div className={styles.headerRight}>
-        <span className={`${styles.jiraHealth} ${jiraConfigured ? styles.online : styles.warn}`}><i/>JIRA {jiraConfigured ? "LIVE" : "DEMO"}</span>
+        <div className={`${styles.usageRail} ${styles.headerUsage}`} aria-label="Provider rate-limit usage"><span className={styles.usageWindow}>AI LIMITS</span><RateLimitBadge label="CLAUDE" limits={providerUsage?.claude.rateLimits}/><RateLimitBadge label="CODEX" limits={providerUsage?.codex.rateLimits} showFiveHour={false}/></div>
         <details className={styles.providerMenu}>
           <summary>PROVIDERS <span aria-hidden="true">⌄</span></summary>
           <div className={styles.providerPopover}>
+            <div className={styles.providerStatus}><span><i className={jiraConfigured ? styles.statusOnline : styles.statusOffline}/>JIRA</span><b>{jiraConfigured ? "LIVE" : "DEMO"}</b></div>
             <div className={styles.providerStatus}><span><i className={claudeConnected ? styles.statusOnline : styles.statusOffline}/>CLAUDE</span><b>{claudeConnected ? "CONNECTED" : "OFFLINE"}</b></div>
             <div className={styles.providerStatus}><span><i className={codexConnected ? styles.statusOnline : styles.statusOffline}/>CODEX</span><b>{codexConnected ? "CONNECTED" : "OFFLINE"}</b></div>
-            <div className={styles.usageRail} aria-label="Provider rate-limit usage"><span className={styles.usageWindow}>LIMITS</span><RateLimitBadge label="CLAUDE" limits={providerUsage?.claude.rateLimits}/><RateLimitBadge label="CODEX" limits={providerUsage?.codex.rateLimits}/></div>
             <a className={styles.providerConsoleLink} href="/chat">MODEL AUTH &amp; PI CONSOLE ↗</a>
           </div>
         </details>
