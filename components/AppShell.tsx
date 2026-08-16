@@ -59,6 +59,8 @@ const LANGUAGE_MENU_WIDTH = 176;
 export function AppShell() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  const embedded = searchParams.get("embedded") === "1";
+  const sprintPilotEmbedded = embedded && searchParams.get("palette") === "sprintpilot";
   const [initialNavigation] = useState(() => getInitialNavigation(searchParams));
   const { preference, toggleTheme } = useTheme();
   const themeLabelKey =
@@ -101,7 +103,7 @@ export function AppShell() {
   const [projectTrustDialogOpen, setProjectTrustDialogOpen] = useState(false);
   const [projectTrustBusy, setProjectTrustBusy] = useState(false);
   const [projectTrustError, setProjectTrustError] = useState<string | null>(null);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(!embedded);
   const [rightPanelOpen, setRightPanelOpen] = useState(false);
   const [mobileToolbarMoreOpen, setMobileToolbarMoreOpen] = useState(false);
   const [mobileSidebarReady, setMobileSidebarReady] = useState(false);
@@ -1606,7 +1608,24 @@ export function AppShell() {
       paddingRight: "env(safe-area-inset-right)",
       overflow: "hidden",
       background: "var(--bg)",
-    }}>
+      ...(sprintPilotEmbedded ? {
+        "--bg": "#050505",
+        "--bg-panel": "#0b0c0d",
+        "--bg-hover": "#14171a",
+        "--bg-selected": "#171a1e",
+        "--border": "#24272b",
+        "--text": "#f0f1f2",
+        "--text-muted": "#a3aab2",
+        "--text-dim": "#68717a",
+        "--accent": "#56e6ff",
+        "--accent-hover": "#8cf1ff",
+        "--user-bg": "#10170b",
+        "--assistant-bg": "#050505",
+        "--tool-bg": "#101316",
+        "--bg-subtle": "rgba(255,255,255,0.035)",
+        colorScheme: "dark",
+      } : {}),
+    } as React.CSSProperties}>
       {/* Mobile overlay backdrop */}
       <div
         className={`sidebar-overlay-backdrop${mobileSidebarReady ? "" : " sidebar-mobile-pending"}`}
@@ -1619,6 +1638,7 @@ export function AppShell() {
           opacity: sidebarOpen ? 1 : 0,
           pointerEvents: sidebarOpen ? "auto" : "none",
           transition: "opacity 0.25s ease",
+          display: embedded ? "none" : undefined,
         }}
       />
 
@@ -1631,7 +1651,7 @@ export function AppShell() {
           "--sidebar-width": `${sidebarResizer.width}px`,
           background: "var(--bg-panel)",
           borderRight: "1px solid var(--border)",
-          display: "flex",
+          display: embedded ? "none" : "flex",
           flexDirection: "column",
           flexShrink: 0,
           paddingTop: "env(safe-area-inset-top)",
@@ -1641,7 +1661,7 @@ export function AppShell() {
       >
         {sidebarContent}
       </div>
-      {sidebarOpen && (
+      {!embedded && sidebarOpen && (
         <div
           {...sidebarResizer.separatorProps}
           aria-controls="session-sidebar"
@@ -1654,7 +1674,7 @@ export function AppShell() {
       {/* Center: chat */}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minWidth: 0 }}>
         {/* Top bar with sidebar toggle */}
-        <div ref={topBarRef} style={{ flexShrink: 0, background: "var(--bg-panel)" }}>
+        <div ref={topBarRef} style={{ flexShrink: 0, background: "var(--bg-panel)", display: embedded ? "none" : undefined }}>
         <div style={{ display: "flex", alignItems: "center", position: "relative", borderBottom: "1px solid var(--border)", height: "calc(36px + env(safe-area-inset-top))", paddingTop: "env(safe-area-inset-top)" }}>
           <button
             onClick={handleSidebarToggle}

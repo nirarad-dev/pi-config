@@ -85,3 +85,17 @@ export const WORKFLOW_STEPS = [
   "Deep review",
   "PR review",
 ] as const;
+
+export type WorkflowStep = (typeof WORKFLOW_STEPS)[number];
+
+export function completedStepsForJiraStatus(status: string): WorkflowStep[] {
+  const normalized = status.trim().toLowerCase();
+  return normalized === "in cr" || normalized === "cr" || normalized === "code review"
+    ? ["Plan", "Develop"]
+    : [];
+}
+
+export function normalizeCompletedSteps(...groups: readonly string[][]): WorkflowStep[] {
+  const completed = new Set(groups.flat());
+  return WORKFLOW_STEPS.filter((step) => completed.has(step));
+}

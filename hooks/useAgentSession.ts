@@ -374,8 +374,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
     const container = scrollContainerRef.current;
-    messagesEndRef.current?.scrollIntoView({ behavior });
-    if (container) previousScrollTopRef.current = container.scrollTop;
+    if (!container) return;
+    // Keep scrolling inside the chat viewport. Element.scrollIntoView() can
+    // also scroll ancestor documents when Pi Web is embedded in an iframe,
+    // which made SprintPilot jump past the agent panel to the diff below it.
+    container.scrollTo({ top: container.scrollHeight, behavior });
+    previousScrollTopRef.current = container.scrollTop;
   }, []);
 
   const currentModel = currentModelOverride ?? data?.context.model ?? pendingModel ?? null;

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "crypto";
 import { execFile } from "child_process";
 import { existsSync, readFileSync, realpathSync } from "fs";
-import { basename, dirname, resolve } from "path";
+import { resolve } from "path";
 import { promisify } from "util";
 
 const execFileAsync = promisify(execFile);
@@ -21,6 +21,20 @@ export function configuredRepoRoot(): string {
   return resolve(process.env.SPRINTPILOT_REPO_ROOT || "/Users/nirarad/git/arnac");
 }
 
+export async function registeredSprintWorktrees(): Promise<Map<string, string | undefined>> {
+  const repo = realpathSync(configuredRepoRoot());
+  const output = await run("git", ["worktree", "list", "--porcelain"], repo);
+  const worktrees = new Map<string, string | undefined>();
+  for (const block of output.split(/\n\n+/)) {
+    const lines = block.split("\n");
+    const path = lines.find((line) => line.startsWith("worktree "))?.slice(9);
+    if (!path || !existsSync(path)) continue;
+    const branch = lines.find((line) => line.startsWith("branch "))?.slice(7).replace(/^refs\/heads\//, "");
+    worktrees.set(realpathSync(path), branch);
+  }
+  return worktrees;
+}
+
 export async function assertSprintWorktree(cwd: unknown): Promise<string> {
   if (typeof cwd !== "string" || !cwd.startsWith("/")) throw new Error("An absolute worktree path is required");
   if (!existsSync(cwd)) throw new Error(`Worktree does not exist: ${cwd}`);
@@ -28,11 +42,8 @@ export async function assertSprintWorktree(cwd: unknown): Promise<string> {
   const repo = realpathSync(configuredRepoRoot());
   const top = realpathSync((await run("git", ["rev-parse", "--show-toplevel"], realCwd)).trim());
   if (top !== realCwd) throw new Error("The path must be the worktree root");
-  const allowedParent = dirname(repo);
-  const allowedPrefix = `${basename(repo)}-`;
-  if (realCwd !== repo && (dirname(realCwd) !== allowedParent || !basename(realCwd).startsWith(allowedPrefix))) {
-    throw new Error("Worktree is outside the configured SprintPilot repository family");
-  }
+  const registered = await registeredSprintWorktrees();
+  if (!registered.has(realCwd)) throw new Error("Path is not a registered worktree of the configured repository");
   const [repoRemote, worktreeRemote] = await Promise.all([
     run("git", ["remote", "get-url", "origin"], repo),
     run("git", ["remote", "get-url", "origin"], realCwd),

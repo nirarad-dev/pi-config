@@ -1,7 +1,15 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { TEST_PRESETS, WORKFLOW_STEPS, type ModelEntry, type SprintTask } from "@/lib/sprintpilot-config";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { vscDarkPlus } from "react-syntax-highlighter/dist/cjs/styles/prism";
+import { completedStepsForJiraStatus, normalizeCompletedSteps, TEST_PRESETS, WORKFLOW_STEPS, type ModelEntry, type SprintTask, type WorkflowStep } from "@/lib/sprintpilot-config";
+import { buildSprintPilotChangeTree, type SprintPilotChangeTreeNode } from "@/lib/sprintpilot-change-tree";
+import { parseDiff } from "@/lib/sprintpilot-diff";
+import { buildReviewFixPrompt, type ReviewComment } from "@/lib/sprintpilot-review";
+import { sprintPilotDiffLanguage } from "@/lib/sprintpilot-syntax";
+import type { ProviderUsage, SprintPilotUsage } from "@/lib/sprintpilot-usage";
+import { FolderIcon, getFileIcon } from "./FileIcons";
 import styles from "./SprintPilot.module.css";
 
 type ModelResponse = {
@@ -11,6 +19,14 @@ type ModelResponse = {
 };
 
 type GitFile = { filePath: string; status: string };
+type WorktreeCandidate = { key: string; worktree: string; branch?: string };
+type LinkSetup = {
+  key: string;
+  loading: boolean;
+  candidates: WorktreeCandidate[];
+  selected?: string;
+  error?: string;
+};
 type AuthProvider = { id: string; name: string; loggedIn: boolean };
 type AuthSetup = {
   provider: "anthropic" | "openai-codex";
@@ -34,7 +50,8 @@ type TaskRuntime = {
   testPreset: string;
   testOptions: string[];
   sessionId?: string;
-  completed: string[];
+  completed: WorkflowStep[];
+  reviewComments: ReviewComment[];
 };
 
 const DEMO_TASKS: SprintTask[] = [
@@ -44,12 +61,22 @@ const DEMO_TASKS: SprintTask[] = [
   { key: "DEV-4840", issueType: "Task", summary: "Expose vault health diagnostics", status: "To Do", priority: "Low", epicKey: "DEV-4800", epicName: "Operational visibility" },
 ];
 
-const initialRuntime = (): TaskRuntime => ({ selectedFiles: [], testPreset: TEST_PRESETS[0].id, testOptions: [], completed: [] });
+const initialRuntime = (): TaskRuntime => ({ selectedFiles: [], testPreset: TEST_PRESETS[0].id, testOptions: [], completed: [], reviewComments: [] });
+const COMPLETED_STEPS_KEY = "sprintpilot-completed-steps-v1";
+const AGENT_STEPS: WorkflowStep[] = ["Plan", "Develop", "Pre-commit", "Deep review", "PR review"];
+const DEFAULT_PROVIDER = "anthropic";
+const DEFAULT_MODEL = "claude-opus-5";
+const DEFAULT_EFFORT = "medium";
 
 const actionPrompts: Record<string, (task: SprintTask) => string> = {
   Plan: (task) => `Plan ${task.key}: ${task.summary}. Inspect the worktree and produce a phased implementation plan. Do not edit files, commit, or push.`,
   Develop: (task) => `Implement ${task.key}: ${task.summary}. Follow the approved plan and repository guidance. Run focused checks, but do not stage, commit, push, or open a PR.`,
+  Test: (task) => `Start a fresh testing session for ${task.key}: ${task.summary}. Inspect the current changes and identify or run the most relevant focused tests. Do not stage, commit, push, or open a PR.`,
   "Pre-commit": (task) => `Review the pending changes for ${task.key} before commit. Run the repository pre-commit checks and fix valid findings, but do not stage or commit anything.`,
+  Approve: (task) => `Review the pending changes for ${task.key} and provide an approval recommendation with any blocking findings. Do not stage, commit, push, or open a PR.`,
+  Commit: (task) => `Assess commit readiness for ${task.key}, summarize the exact intended files, and propose a commit message. Do not stage or commit anything.`,
+  Push: (task) => `Assess push readiness for ${task.key}, including branch state and required checks. Do not push or make any Git writes.`,
+  "Open PR": (task) => `Prepare a pull request title and description for ${task.key} from the current changes. Do not push or open the pull request.`,
   "Deep review": (task) => `Deep-review the pending ${task.key} changes at standard depth. Pin the current head, review with structured and holistic passes, then debunk every finding. Report only validated findings. Do not post, commit, or push.`,
   "PR review": (task) => `Run the PR-review workflow for ${task.key}: intake, triage, plan, then stop for approval before executing fixes. Preserve the workflow's hard approval gates. Do not commit, push, or post review replies without explicit approval.`,
 };
@@ -61,9 +88,192 @@ function providerLabel(provider: string) {
   return provider;
 }
 
+function isDefaultModel(model: ModelEntry) {
+  return model.provider === DEFAULT_PROVIDER && model.id === DEFAULT_MODEL;
+}
+
+function preferredEffort(levels: Record<string, string[]>, model: ModelEntry) {
+  const supported = levels[`${model.provider}:${model.id}`] || ["off"];
+  return supported.includes(DEFAULT_EFFORT) ? DEFAULT_EFFORT : supported[0];
+}
+
+function compactTokens(tokens: number) {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(tokens >= 10_000_000 ? 0 : 1)}M`;
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(tokens >= 100_000 ? 0 : 1)}K`;
+  return String(tokens);
+}
+
+function UsageBadge({ label, usage }: { label: string; usage?: ProviderUsage }) {
+  return <span className={styles.usageBadge}><b>{label}</b><strong>{usage ? compactTokens(usage.tokens) : "—"}</strong><small>TOK · {usage?.turns ?? "—"} TURNS</small></span>;
+}
+
+function ClaudeUsageBadge({ usage }: { usage?: SprintPilotUsage["claude"] }) {
+  const limits = usage?.rateLimits;
+  const percentage = (value?: number) => value === undefined ? "—" : `${Math.round(value)}%`;
+  return <span className={styles.claudeUsageBadge}>
+    <b>CLAUDE</b>
+    <span title={limits?.fiveHour?.resetsAt ? `Resets ${new Date(limits.fiveHour.resetsAt).toLocaleString()}` : undefined}><small>5H</small><strong>{percentage(limits?.fiveHour?.usedPercentage)}</strong></span>
+    <span title={limits?.weekly?.resetsAt ? `Resets ${new Date(limits.weekly.resetsAt).toLocaleString()}` : undefined}><small>WEEK</small><strong>{percentage(limits?.weekly?.usedPercentage)}</strong></span>
+  </span>;
+}
+
+function fileParts(filePath: string) {
+  const parts = filePath.split("/");
+  return { name: parts.pop() || filePath, directory: parts.join("/") };
+}
+
+function changeStatusClass(status: string): string {
+  const code = status.slice(0, 1).toUpperCase();
+  if (code === "D") return styles.status_D;
+  if (code === "R") return styles.status_R;
+  if (code === "M") return styles.status_M;
+  return styles.status_A;
+}
+
+function ChangeTree({
+  nodes,
+  collapsed,
+  activePath,
+  selectedPaths,
+  onToggleDirectory,
+  onOpenFile,
+  onSelectFile,
+}: {
+  nodes: SprintPilotChangeTreeNode[];
+  collapsed: Set<string>;
+  activePath?: string;
+  selectedPaths: Set<string>;
+  onToggleDirectory: (path: string) => void;
+  onOpenFile: (path: string) => void;
+  onSelectFile: (path: string, selected: boolean) => void;
+}) {
+  return <>{nodes.map((node) => {
+    if (node.kind === "directory") {
+      const isOpen = !collapsed.has(node.path);
+      return <div className={styles.treeDirectory} key={node.path}>
+        <button className={styles.treeFolderRow} type="button" aria-expanded={isOpen} onClick={() => onToggleDirectory(node.path)} title={node.path}>
+          <span className={`${styles.treeChevron} ${isOpen ? styles.treeChevronOpen : ""}`}>›</span>
+          <FolderIcon size={15} open={isOpen}/>
+          <b>{node.name}</b>
+          <small>{node.fileCount}</small>
+        </button>
+        {isOpen && <div className={styles.treeChildren}><ChangeTree nodes={node.children} collapsed={collapsed} activePath={activePath} selectedPaths={selectedPaths} onToggleDirectory={onToggleDirectory} onOpenFile={onOpenFile} onSelectFile={onSelectFile}/></div>}
+      </div>;
+    }
+
+    const status = node.status.slice(0, 1).toUpperCase();
+    return <div className={`${styles.fileRow} ${styles.treeFileRow} ${activePath === node.path ? styles.activeFile : ""}`} key={node.path}>
+      <label className={styles.fileCheckbox} title={`Include ${node.path} in commit approval`}><input aria-label={`Include ${node.path} in commit approval`} type="checkbox" checked={selectedPaths.has(node.path)} onChange={(event) => onSelectFile(node.path, event.target.checked)}/></label>
+      <button type="button" onClick={() => onOpenFile(node.path)} title={node.path}><span className={styles.treeFileIcon}>{getFileIcon(node.name, 15)}</span><span className={styles.fileIdentity}><b>{node.name}</b></span><em className={changeStatusClass(status)}>{status}</em></button>
+    </div>;
+  })}</>;
+}
+
+function HighlightedDiffCode({ text, language }: { text: string; language?: string }) {
+  if (!language) return <code>{text || " "}</code>;
+  return <SyntaxHighlighter
+    language={language}
+    style={vscDarkPlus}
+    PreTag="code"
+    CodeTag="span"
+    className={styles.diffSyntax}
+    customStyle={{ margin: 0, padding: "0 14px 0 8px", overflow: "visible", background: "transparent", font: "inherit", whiteSpace: "pre" }}
+    codeTagProps={{ style: { font: "inherit", whiteSpace: "inherit" } }}
+  >{text || " "}</SyntaxHighlighter>;
+}
+
+function DiffEditor({
+  filePath,
+  patch,
+  comments,
+  onAddComment,
+  onDeleteComment,
+}: {
+  filePath?: string;
+  patch: string;
+  comments: ReviewComment[];
+  onAddComment: (comment: Omit<ReviewComment, "id">) => void;
+  onDeleteComment: (id: string) => void;
+}) {
+  const [commentingOn, setCommentingOn] = useState<{ line: number; side: "old" | "new"; kind: ReviewComment["kind"]; code: string } | null>(null);
+  const [commentBody, setCommentBody] = useState("");
+
+  useEffect(() => {
+    setCommentingOn(null);
+    setCommentBody("");
+  }, [filePath]);
+
+  if (!filePath) return <div className={styles.editorEmpty}><span>⌘</span><b>Select a changed file</b><small>Its changes will open here in a read-only editor.</small></div>;
+  if (!patch) return <div className={styles.editorEmpty}><span>···</span><b>Loading changes</b></div>;
+  const hunks = parseDiff(patch);
+  if (!hunks.length) return <div className={styles.editorEmpty}><span>◇</span><b>Preview unavailable</b><small>{patch}</small></div>;
+  const { name, directory } = fileParts(filePath);
+  const language = sprintPilotDiffLanguage(filePath);
+  return <div className={styles.diffEditor}>
+    <div className={styles.editorTab}><span className={styles.fileGlyph}>{name.split(".").pop()?.slice(0, 2).toUpperCase() || "F"}</span><b>{name}</b><small>{directory}</small><em>{language ? `${language.toUpperCase()} · ` : ""}READ ONLY</em></div>
+    <div className={styles.editorCode}>{hunks.map((hunk, hunkIndex) => <section className={styles.diffHunk} key={`${hunk.label}-${hunkIndex}`}>
+      <div className={styles.hunkHeader}><span>⋯</span>{hunk.label}</div>
+      {hunk.lines.map((line, lineIndex) => {
+        const side = line.kind === "removed" ? "old" : "new";
+        const lineNumber = side === "old" ? line.oldLine : line.newLine;
+        if (lineNumber === undefined) return null;
+        const lineComments = comments.filter((comment) => comment.line === lineNumber && comment.side === side);
+        const isCommenting = commentingOn?.line === lineNumber && commentingOn.side === side;
+        return <div className={styles.diffLineGroup} key={`${hunkIndex}-${lineIndex}`}>
+          <div className={`${styles.codeLine} ${styles[`line_${line.kind}`]}`}>
+            <button
+              className={`${styles.commentPin} ${lineComments.length ? styles.commentPinActive : ""}`}
+              type="button"
+              title={`Comment on ${side === "old" ? "old " : ""}line ${lineNumber}`}
+              aria-label={`Comment on ${filePath} ${side === "old" ? "old " : ""}line ${lineNumber}`}
+              onClick={() => {
+                setCommentingOn(isCommenting ? null : { line: lineNumber, side, kind: line.kind, code: line.content });
+                setCommentBody("");
+              }}
+            >{lineComments.length || "+"}</button>
+            <span className={styles.oldLine}>{line.oldLine ?? ""}</span><span className={styles.newLine}>{line.newLine ?? ""}</span><span className={styles.changeMark}>{line.kind === "added" ? "+" : line.kind === "removed" ? "−" : ""}</span><HighlightedDiffCode text={line.content} language={language}/>
+          </div>
+          {lineComments.map((comment) => <div className={`${styles.reviewComment} ${comment.sentAt ? styles.reviewCommentSent : ""}`} key={comment.id}>
+            <span>{comment.sentAt ? "SENT TO AGENT" : "REVIEW NOTE"}</span><p>{comment.body}</p><button type="button" onClick={() => onDeleteComment(comment.id)} aria-label={`Delete comment on line ${lineNumber}`}>×</button>
+          </div>)}
+          {isCommenting && <form className={styles.commentComposer} onSubmit={(event) => {
+            event.preventDefault();
+            if (!commentBody.trim()) return;
+            onAddComment({ filePath, line: lineNumber, side, kind: line.kind, code: line.content, body: commentBody.trim() });
+            setCommentingOn(null);
+            setCommentBody("");
+          }}>
+            <label>COMMENT ON {side === "old" ? "OLD " : ""}LINE {lineNumber}</label>
+            <textarea autoFocus value={commentBody} onChange={(event) => setCommentBody(event.target.value)} placeholder="Describe what the agent should change…" rows={3}/>
+            <div><button type="button" onClick={() => { setCommentingOn(null); setCommentBody(""); }}>CANCEL</button><button type="submit" disabled={!commentBody.trim()}>ADD COMMENT</button></div>
+          </form>}
+        </div>;
+      })}
+    </section>)}</div>
+  </div>;
+}
+
 function isCompletedTask(task: SprintTask) {
   if (task.statusCategory?.toLowerCase() === "done") return true;
   return /^(done|closed|resolved|completed|cancelled|canceled)$/i.test(task.status.trim());
+}
+
+function storedCompletedSteps(key: string): WorkflowStep[] {
+  try {
+    const stored = JSON.parse(localStorage.getItem(COMPLETED_STEPS_KEY) || "{}") as Record<string, string[]>;
+    return normalizeCompletedSteps(stored[key] || []);
+  } catch {
+    return [];
+  }
+}
+
+function persistCompletedSteps(key: string, completed: string[]) {
+  try {
+    const stored = JSON.parse(localStorage.getItem(COMPLETED_STEPS_KEY) || "{}") as Record<string, string[]>;
+    localStorage.setItem(COMPLETED_STEPS_KEY, JSON.stringify({ ...stored, [key]: normalizeCompletedSteps(completed) }));
+  } catch {
+    return;
+  }
 }
 
 function IssueTypeIcon({ type, epic = false }: { type?: string; epic?: boolean }) {
@@ -97,30 +307,40 @@ export function SprintPilot() {
   const [models, setModels] = useState<ModelEntry[]>([]);
   const [thinkingLevels, setThinkingLevels] = useState<Record<string, string[]>>({});
   const [authProviders, setAuthProviders] = useState<AuthProvider[]>([]);
+  const [providerUsage, setProviderUsage] = useState<SprintPilotUsage | null>(null);
   const [gitFiles, setGitFiles] = useState<GitFile[]>([]);
   const [testFiles, setTestFiles] = useState<string[]>([]);
-  const [diff, setDiff] = useState("Select a changed file to inspect its patch.");
-  const [notice, setNotice] = useState("Ready. Every write action requires a deliberate click.");
+  const [diff, setDiff] = useState("");
+  const [activeDiffFile, setActiveDiffFile] = useState<string>();
+  const [collapsedChangeFolders, setCollapsedChangeFolders] = useState<Set<string>>(() => new Set());
+  const [developmentOpen, setDevelopmentOpen] = useState(true);
+  const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{ key: string; worktree: string } | null>(null);
+  const [linkSetup, setLinkSetup] = useState<LinkSetup | null>(null);
+  const [restartStep, setRestartStep] = useState<WorkflowStep | null>(null);
   const [authSetup, setAuthSetup] = useState<AuthSetup | null>(null);
   const authEvents = useRef<EventSource | null>(null);
 
   const task = tasks.find((candidate) => candidate.key === activeKey) || tasks[0];
   const storedState = runtime[activeKey] || initialRuntime();
-  const fallbackModel = models[0];
+  const fallbackModel = models.find(isDefaultModel) || models[0];
   const state: TaskRuntime = {
     ...storedState,
     provider: storedState.provider || fallbackModel?.provider,
     modelId: storedState.modelId || fallbackModel?.id,
-    effort: storedState.effort || (fallbackModel ? (thinkingLevels[`${fallbackModel.provider}:${fallbackModel.id}`] || ["off"])[0] : "off"),
+    effort: storedState.effort || (fallbackModel ? preferredEffort(thinkingLevels, fallbackModel) : "off"),
   };
   const activePreset = TEST_PRESETS.find((preset) => preset.id === state.testPreset) || TEST_PRESETS[0];
   const modelKey = state.provider && state.modelId ? `${state.provider}:${state.modelId}` : "";
   const effortOptions = thinkingLevels[modelKey] || ["off"];
 
   const updateRuntime = useCallback((patch: Partial<TaskRuntime>) => {
-    setRuntime((current) => ({ ...current, [activeKey]: { ...(current[activeKey] || initialRuntime()), ...patch } }));
+    setRuntime((current) => {
+      const next = { ...(current[activeKey] || initialRuntime()), ...patch };
+      if (patch.completed) persistCompletedSteps(activeKey, next.completed);
+      return { ...current, [activeKey]: next };
+    });
   }, [activeKey]);
 
   useEffect(() => {
@@ -137,6 +357,7 @@ export function SprintPilot() {
         setRuntime(Object.fromEntries(loadedTasks.map((loadedTask) => [loadedTask.key, {
           ...initialRuntime(),
           ...worktrees.get(loadedTask.key),
+          completed: normalizeCompletedSteps(completedStepsForJiraStatus(loadedTask.status), storedCompletedSteps(loadedTask.key)),
         }])));
       })
       .catch((error) => setNotice(error.message));
@@ -150,18 +371,29 @@ export function SprintPilot() {
         const available = relevant.length ? relevant : (data.modelList || []);
         setModels(available);
         setThinkingLevels(data.thinkingLevels || {});
-        const preferred = available.find((model) => model.provider === data.defaultModel?.provider && model.id === data.defaultModel?.modelId) || available[0];
+        const preferred = available.find(isDefaultModel)
+          || available.find((model) => model.provider === data.defaultModel?.provider && model.id === data.defaultModel?.modelId)
+          || available[0];
         if (preferred) {
           setRuntime((current) => Object.fromEntries(Object.entries(current).map(([key, value]) => [key, {
             ...value,
             provider: value.provider || preferred.provider,
             modelId: value.modelId || preferred.id,
-            effort: value.effort || (data.thinkingLevels?.[`${preferred.provider}:${preferred.id}`] || ["off"])[0],
+            effort: value.effort || preferredEffort(data.thinkingLevels || {}, preferred),
           }])));
         }
       })
       .catch((error) => setNotice(error.message));
     return () => authEvents.current?.close();
+  }, []);
+
+  useEffect(() => {
+    const refreshUsage = () => jsonRequest<{ usage: SprintPilotUsage }>("/api/sprintpilot/usage")
+      .then((data) => setProviderUsage(data.usage))
+      .catch(() => setProviderUsage(null));
+    refreshUsage();
+    const timer = window.setInterval(refreshUsage, 60_000);
+    return () => window.clearInterval(timer);
   }, []);
 
   const connectProvider = (provider: "anthropic" | "openai-codex") => {
@@ -212,28 +444,65 @@ export function SprintPilot() {
     setAuthSetup(null);
   };
 
-  useEffect(() => {
+  const refreshWorkspace = useCallback(async () => {
     if (!state.worktree) {
       setGitFiles([]);
       setTestFiles([]);
       return;
     }
-    Promise.all([
+    const [git, tests] = await Promise.all([
       jsonRequest<{ files: GitFile[] }>(`/api/git/status?cwd=${encodeURIComponent(state.worktree)}`),
       jsonRequest<{ files: string[] }>(`/api/sprintpilot/tests?cwd=${encodeURIComponent(state.worktree)}`),
-    ]).then(([git, tests]) => {
-      setGitFiles(git.files);
-      setTestFiles(tests.files);
-    }).catch((error) => setNotice(error.message));
-  }, [state.worktree, activeKey]);
+    ]);
+    setGitFiles(git.files);
+    setTestFiles(tests.files);
+    const availableFiles = new Set(git.files.map((file) => file.filePath.replace(`${state.worktree}/`, "")));
+    if (state.selectedFiles.some((file) => !availableFiles.has(file))) {
+      updateRuntime({ approvalToken: undefined, selectedFiles: state.selectedFiles.filter((file) => availableFiles.has(file)) });
+    }
+  }, [state.worktree, state.selectedFiles, updateRuntime]);
+
+  useEffect(() => {
+    refreshWorkspace().catch((error) => setNotice(error.message));
+  }, [refreshWorkspace, activeKey]);
+
+  useEffect(() => {
+    setActiveDiffFile(undefined);
+    setDiff("");
+    setCollapsedChangeFolders(new Set());
+  }, [activeKey]);
 
   const openTask = (key: string) => {
     setOpenKeys((keys) => keys.includes(key) ? keys : [...keys, key]);
-    setRuntime((current) => current[key] ? current : { ...current, [key]: initialRuntime() });
+    setRuntime((current) => {
+      if (current[key]) return current;
+      const selectedTask = tasks.find((candidate) => candidate.key === key);
+      return { ...current, [key]: {
+        ...initialRuntime(),
+        completed: normalizeCompletedSteps(selectedTask ? completedStepsForJiraStatus(selectedTask.status) : [], storedCompletedSteps(key)),
+      } };
+    });
     setActiveKey(key);
   };
 
-  const runPiAction = async (step: string) => {
+  const handleFlowStep = (step: WorkflowStep) => {
+    if (state.completed.includes(step)) {
+      setRestartStep(step);
+      return;
+    }
+    const completed = normalizeCompletedSteps(state.completed, [step]);
+    updateRuntime({ completed });
+    setNotice(`${step} marked complete for ${task?.key}. Click it again to start a fresh Pi session.`);
+  };
+
+  const restartCompletedStep = async () => {
+    if (!restartStep) return;
+    const step = restartStep;
+    setRestartStep(null);
+    await runPiAction(step);
+  };
+
+  const runPiAction = async (step: WorkflowStep) => {
     if (!task || !state.worktree || !state.provider || !state.modelId || !actionPrompts[step]) return;
     setBusy(step);
     try {
@@ -242,8 +511,27 @@ export function SprintPilot() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ cwd: state.worktree, type: "prompt", message: actionPrompts[step](task), provider: state.provider, modelId: state.modelId, thinkingLevel: state.effort }),
       });
-      updateRuntime({ sessionId: result.sessionId, completed: [...new Set([...state.completed, step])] });
+      updateRuntime({ sessionId: result.sessionId, completed: normalizeCompletedSteps(state.completed, [step]) });
       setNotice(`${step} started with ${providerLabel(state.provider)} · ${state.modelId} · ${state.effort}.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const startDevelopmentSession = async () => {
+    if (!task || !state.worktree || !state.provider || !state.modelId) return;
+    setBusy("development-session");
+    try {
+      const result = await jsonRequest<{ sessionId: string }>("/api/agent/new", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd: state.worktree, type: "ensure_session", provider: state.provider, modelId: state.modelId, thinkingLevel: state.effort }),
+      });
+      updateRuntime({ sessionId: result.sessionId });
+      setDevelopmentOpen(true);
+      setNotice(`Development conversation started for ${task.key}.`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
@@ -264,6 +552,35 @@ export function SprintPilot() {
     finally { setBusy(null); }
   };
 
+  const findExistingWorktrees = async () => {
+    if (!task) return;
+    const key = task.key;
+    setLinkSetup({ key, loading: true, candidates: [] });
+    try {
+      const result = await jsonRequest<{ candidates: WorktreeCandidate[] }>(`/api/sprintpilot/worktree?key=${encodeURIComponent(key)}`);
+      setLinkSetup({ key, loading: false, candidates: result.candidates, selected: result.candidates[0]?.worktree });
+    } catch (error) {
+      setLinkSetup({ key, loading: false, candidates: [], error: error instanceof Error ? error.message : String(error) });
+    }
+  };
+
+  const linkExistingWorktree = async () => {
+    if (!linkSetup?.selected || linkSetup.key !== activeKey) return;
+    setBusy("link-worktree");
+    try {
+      const result = await jsonRequest<{ worktree: string; branch?: string }>("/api/sprintpilot/worktree", {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ key: linkSetup.key, cwd: linkSetup.selected }),
+      });
+      updateRuntime(result);
+      setLinkSetup(null);
+      setNotice(`Linked existing worktree: ${result.worktree}`);
+    } catch (error) {
+      setLinkSetup((current) => current ? { ...current, error: error instanceof Error ? error.message : String(error) } : current);
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const deleteWorktree = async () => {
     if (!deleteTarget) return;
     setBusy("delete-worktree");
@@ -271,7 +588,7 @@ export function SprintPilot() {
       await jsonRequest("/api/sprintpilot/worktree", {
         method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd: deleteTarget.worktree }),
       });
-      updateRuntime({ worktree: undefined, branch: undefined, sessionId: undefined, approvalToken: undefined, selectedFiles: [], completed: [] });
+      updateRuntime({ worktree: undefined, branch: undefined, sessionId: undefined, approvalToken: undefined, selectedFiles: [], completed: task ? completedStepsForJiraStatus(task.status) : [] });
       setDeleteTarget(null);
       setNotice(`Deleted the ${deleteTarget.key} worktree. Its Git branch was retained.`);
     } catch (error) {
@@ -283,8 +600,63 @@ export function SprintPilot() {
 
   const inspectDiff = async (file: GitFile) => {
     if (!state.worktree) return;
-    const result = await jsonRequest<{ supported: boolean; patch?: string }>(`/api/git/diff?cwd=${encodeURIComponent(state.worktree)}&path=${encodeURIComponent(file.filePath)}`);
-    setDiff(result.supported && result.patch ? result.patch : "Binary or oversized diff; inspect it in the Pi workspace.");
+    setActiveDiffFile(file.filePath);
+    setDiff("");
+    try {
+      const result = await jsonRequest<{ supported: boolean; patch?: string }>(`/api/git/diff?cwd=${encodeURIComponent(state.worktree)}&path=${encodeURIComponent(file.filePath)}`);
+      setDiff(result.supported && result.patch ? result.patch : "This file is binary or too large to preview. Open the full Pi workspace to inspect it.");
+    } catch (error) {
+      setDiff(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const addReviewComment = (comment: Omit<ReviewComment, "id">) => {
+    updateRuntime({ reviewComments: [...state.reviewComments, { ...comment, id: crypto.randomUUID() }] });
+  };
+
+  const deleteReviewComment = (id: string) => {
+    updateRuntime({ reviewComments: state.reviewComments.filter((comment) => comment.id !== id) });
+  };
+
+  const sendReviewComments = async () => {
+    if (!task || !state.worktree || !state.provider || !state.modelId) return;
+    const pending = state.reviewComments.filter((comment) => !comment.sentAt);
+    const message = buildReviewFixPrompt(task.key, pending);
+    if (!message) return;
+
+    setBusy("review-comments");
+    try {
+      let sessionId = state.sessionId;
+      if (!sessionId) {
+        const result = await jsonRequest<{ sessionId: string }>("/api/agent/new", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cwd: state.worktree, type: "ensure_session", provider: state.provider, modelId: state.modelId, thinkingLevel: state.effort }),
+        });
+        sessionId = result.sessionId;
+        updateRuntime({ sessionId });
+        setDevelopmentOpen(true);
+      }
+
+      await jsonRequest(`/api/agent/${encodeURIComponent(sessionId)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: "prompt", message }),
+      });
+
+      const sentIds = new Set(pending.map((comment) => comment.id));
+      const sentAt = new Date().toISOString();
+      updateRuntime({
+        sessionId,
+        reviewComments: state.reviewComments.map((comment) => sentIds.has(comment.id) ? { ...comment, sentAt } : comment),
+      });
+      setDevelopmentOpen(true);
+      setNotice(`${pending.length} review ${pending.length === 1 ? "comment" : "comments"} sent to the active Pi session with file and line references.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
   };
 
   const runTest = async () => {
@@ -295,7 +667,7 @@ export function SprintPilot() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ cwd: state.worktree, file: state.testFile, preset: state.testPreset, options: state.testOptions }),
       });
-      updateRuntime({ completed: [...new Set([...state.completed, "Test"])] });
+      updateRuntime({ completed: normalizeCompletedSteps(state.completed, ["Test"]) });
       setNotice(result.output || "Test completed successfully.");
     } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
     finally { setBusy(null); }
@@ -309,10 +681,10 @@ export function SprintPilot() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action, cwd: state.worktree, files: state.selectedFiles, approvalToken: state.approvalToken, title: `${task.key}: ${task.summary}`, ...extra }),
       });
-      if (action === "approve") updateRuntime({ approvalToken: result.approvalToken, completed: [...new Set([...state.completed, "Approve"])] });
-      if (action === "commit") updateRuntime({ approvalToken: undefined, completed: [...new Set([...state.completed, "Commit"])] });
-      if (action === "push") updateRuntime({ completed: [...new Set([...state.completed, "Push"])] });
-      if (action === "pr") updateRuntime({ completed: [...new Set([...state.completed, "Open PR"])] });
+      if (action === "approve") updateRuntime({ approvalToken: result.approvalToken, completed: normalizeCompletedSteps(state.completed, ["Approve"]) });
+      if (action === "commit") updateRuntime({ approvalToken: undefined, completed: normalizeCompletedSteps(state.completed, ["Commit"]) });
+      if (action === "push") updateRuntime({ completed: normalizeCompletedSteps(state.completed, ["Push"]) });
+      if (action === "pr") updateRuntime({ completed: normalizeCompletedSteps(state.completed, ["Open PR"]) });
       setNotice(result.url || result.output || (action === "approve" ? "Selection approved. The token expires in 30 minutes and becomes invalid if any selected file changes." : `${action} complete.`));
     } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
     finally { setBusy(null); }
@@ -321,15 +693,36 @@ export function SprintPilot() {
   const providerGroups = useMemo(() => [...new Set(models.map((model) => model.provider))], [models]);
   const claudeConnected = authProviders.find((provider) => provider.id === "anthropic")?.loggedIn;
   const codexConnected = authProviders.find((provider) => provider.id === "openai-codex")?.loggedIn;
+  const relativeGitFiles = useMemo(() => gitFiles.map((file) => ({
+    source: file,
+    relativePath: state.worktree ? file.filePath.replace(`${state.worktree}/`, "") : file.filePath,
+  })), [gitFiles, state.worktree]);
+  const changedFilePaths = relativeGitFiles.map((file) => file.relativePath);
+  const changedFilesByPath = new Map(relativeGitFiles.map((file) => [file.relativePath, file.source]));
+  const changeTree = useMemo(() => buildSprintPilotChangeTree(relativeGitFiles.map((file) => ({
+    filePath: file.relativePath,
+    status: file.source.status,
+  }))), [relativeGitFiles]);
+  const selectedFilePaths = new Set(state.selectedFiles);
+  const activeDiffPath = activeDiffFile
+    ? (state.worktree ? activeDiffFile.replace(`${state.worktree}/`, "") : activeDiffFile)
+    : undefined;
+  const pendingReviewComments = state.reviewComments.filter((comment) => !comment.sentAt);
 
   return <main className={styles.shell}>
     <header className={styles.topbar}>
       <div className={styles.brand}><span className={styles.mark}>π</span><div><strong>SPRINTPILOT</strong><small>CONTROL PLANE</small></div></div>
-      <div className={styles.connections}>
-        <span className={jiraConfigured ? styles.online : styles.warn}>● JIRA {jiraConfigured ? "LIVE" : "DEMO"}</span>
-        <span className={claudeConnected ? styles.online : styles.warn}>● CLAUDE {claudeConnected ? "CONNECTED" : "OFFLINE"}</span>
-        <span className={codexConnected ? styles.online : styles.warn}>● CODEX {codexConnected ? "CONNECTED" : "OFFLINE"}</span>
-        <a href="/chat">MODEL AUTH & PI CONSOLE ↗</a>
+      <div className={styles.headerRight}>
+        <span className={`${styles.jiraHealth} ${jiraConfigured ? styles.online : styles.warn}`}><i/>JIRA {jiraConfigured ? "LIVE" : "DEMO"}</span>
+        <details className={styles.providerMenu}>
+          <summary>PROVIDERS <span aria-hidden="true">⌄</span></summary>
+          <div className={styles.providerPopover}>
+            <div className={styles.providerStatus}><span><i className={claudeConnected ? styles.statusOnline : styles.statusOffline}/>CLAUDE</span><b>{claudeConnected ? "CONNECTED" : "OFFLINE"}</b></div>
+            <div className={styles.providerStatus}><span><i className={codexConnected ? styles.statusOnline : styles.statusOffline}/>CODEX</span><b>{codexConnected ? "CONNECTED" : "OFFLINE"}</b></div>
+            <div className={styles.usageRail} aria-label="Provider usage"><span className={styles.usageWindow}>USAGE</span><ClaudeUsageBadge usage={providerUsage?.claude}/><UsageBadge label="CODEX" usage={providerUsage?.codex}/></div>
+            <a className={styles.providerConsoleLink} href="/chat">MODEL AUTH &amp; PI CONSOLE ↗</a>
+          </div>
+        </details>
       </div>
     </header>
 
@@ -351,7 +744,7 @@ export function SprintPilot() {
           <div className={styles.taskHeader}>
             <div><span className={styles.eyebrow}><span><IssueTypeIcon type={task.issueType}/>{task.issueType || "Task"} {task.key}</span><span>{task.status}</span>{task.epicName && <span><IssueTypeIcon epic/>EPIC {task.epicKey} · {task.epicName}</span>}</span><h1>{task.summary}</h1><p>{state.worktree || "No worktree yet — create one from the latest origin/main before starting."}</p></div>
             {!state.worktree
-              ? <button className={styles.primary} disabled={!!busy} onClick={createWorktree}>{busy === "worktree" ? "CREATING…" : "CREATE WORKTREE"}</button>
+              ? <div className={styles.worktreeActions}><button className={styles.primary} disabled={!!busy} onClick={createWorktree}>{busy === "worktree" ? "CREATING…" : "CREATE WORKTREE"}</button><button className={styles.secondary} disabled={!!busy} onClick={findExistingWorktrees}>LINK EXISTING WT</button></div>
               : <button className={styles.danger} disabled={!!busy} onClick={() => setDeleteTarget({ key: task.key, worktree: state.worktree! })}>DELETE WT</button>}
           </div>
 
@@ -374,12 +767,66 @@ export function SprintPilot() {
             {!codexConnected && <button onClick={() => connectProvider("openai-codex")}>CONNECT CODEX</button>}
           </section>}
 
-          <div className={styles.flow}>{WORKFLOW_STEPS.map((step, index) => <div key={step} className={state.completed.includes(step) ? styles.flowDone : ""}><span>{String(index + 1).padStart(2, "0")}</span><b>{step}</b></div>)}</div>
+          <div className={styles.flow}>{WORKFLOW_STEPS.map((step, index) => {
+            const completed = state.completed.includes(step);
+            const jiraSynced = task ? completedStepsForJiraStatus(task.status).includes(step) : false;
+            return <button type="button" key={step} className={completed ? styles.flowDone : ""} aria-pressed={completed} disabled={!!busy} title={completed ? `${step} is complete${jiraSynced ? ` from Jira status ${task.status}` : ""}. Click to start a new session.` : `Mark ${step} complete.`} onClick={() => handleFlowStep(step)}><span>{completed ? "✓" : String(index + 1).padStart(2, "0")}</span><b>{step}</b></button>;
+          })}</div>
+          <p className={styles.flowHint}>Click an incomplete step to mark it done. Completed steps open a new-session confirmation. Jira “In CR” completes Plan and Develop.</p>
 
           <div className={styles.grid}>
+            <section className={`${styles.panel} ${styles.developmentPanel}`}>
+              <div className={styles.panelHead}><span>DEVELOPMENT CONVERSATION</span><small>{state.sessionId ? `${providerLabel(state.provider || "")} · ${state.modelId}` : "TASK-SCOPED PI SESSION"}</small></div>
+              {!state.worktree ? <div className={styles.developmentEmpty}><p>Link or create a worktree to start a development conversation for this Jira task.</p></div>
+                : !state.sessionId ? <div className={styles.developmentEmpty}><p>Talk to the selected model without leaving SprintPilot. The session runs in this task&apos;s worktree and follows the current model and effort settings.</p><button className={styles.primary} disabled={!!busy || !state.provider || !state.modelId} onClick={startDevelopmentSession}>{busy === "development-session" ? "STARTING…" : "START DEVELOPMENT CONVERSATION"}</button></div>
+                  : <><div className={styles.developmentToolbar}><span>● ACTIVE IN {state.worktree}</span><button onClick={() => setDevelopmentOpen((open) => !open)}>{developmentOpen ? "COLLAPSE" : "EXPAND"}</button><a href={`/chat?session=${encodeURIComponent(state.sessionId)}`}>OPEN FULL PI CHAT ↗</a></div>{developmentOpen && <iframe className={styles.developmentFrame} title={`${task.key} development conversation`} src={`/chat?session=${encodeURIComponent(state.sessionId)}&embedded=1&palette=sprintpilot`}/>}</>}
+            </section>
+
+            <section className={`${styles.panel} ${styles.changesPanel}`}>
+              <div className={styles.panelHead}><span>REVIEW FILES &amp; APPROVE COMMIT</span><small className={state.approvalToken ? styles.approvedState : styles.pendingState}>{state.approvalToken ? `✓ ${state.selectedFiles.length} FILES APPROVED` : `${gitFiles.length} CHANGED · NOT APPROVED`}</small></div>
+              <div className={styles.reviewTools}><button disabled={!gitFiles.length || !!busy} onClick={() => updateRuntime({ approvalToken: undefined, selectedFiles: changedFilePaths })}>SELECT ALL</button><button disabled={!state.selectedFiles.length || !!busy} onClick={() => updateRuntime({ approvalToken: undefined, selectedFiles: [] })}>CLEAR</button><button disabled={!state.worktree || !!busy} onClick={() => refreshWorkspace().then(() => setNotice("Pending changes refreshed.")).catch((error) => setNotice(error.message))}>REFRESH CHANGES</button><span>{state.selectedFiles.length} OF {gitFiles.length} SELECTED</span></div>
+              <div className={styles.changeLayout}>
+                <div className={styles.fileExplorer}><div className={styles.explorerHead}><span>CHANGES</span><b>{gitFiles.length}</b></div><div className={styles.fileList}>{gitFiles.length ? <ChangeTree
+                  nodes={changeTree}
+                  collapsed={collapsedChangeFolders}
+                  activePath={activeDiffPath}
+                  selectedPaths={selectedFilePaths}
+                  onToggleDirectory={(path) => setCollapsedChangeFolders((current) => {
+                    const next = new Set(current);
+                    if (next.has(path)) next.delete(path);
+                    else next.add(path);
+                    return next;
+                  })}
+                  onOpenFile={(path) => {
+                    const file = changedFilesByPath.get(path);
+                    if (file) void inspectDiff(file);
+                  }}
+                  onSelectFile={(path, selected) => updateRuntime({ approvalToken: undefined, selectedFiles: selected ? [...state.selectedFiles, path] : state.selectedFiles.filter((item) => item !== path) })}
+                /> : <p className={styles.empty}>{state.worktree ? "No pending changes detected. Use Refresh changes after the development session edits files." : "Link or create a worktree to review its files."}</p>}</div></div>
+                <DiffEditor
+                  filePath={activeDiffFile ? (state.worktree ? activeDiffFile.replace(`${state.worktree}/`, "") : activeDiffFile) : undefined}
+                  patch={diff}
+                  comments={state.reviewComments.filter((comment) => comment.filePath === (activeDiffFile ? (state.worktree ? activeDiffFile.replace(`${state.worktree}/`, "") : activeDiffFile) : ""))}
+                  onAddComment={addReviewComment}
+                  onDeleteComment={deleteReviewComment}
+                />
+              </div>
+              <div className={styles.reviewDispatch}>
+                <div><b>{pendingReviewComments.length ? `${pendingReviewComments.length} REVIEW ${pendingReviewComments.length === 1 ? "COMMENT" : "COMMENTS"} READY` : "NO UNSENT REVIEW COMMENTS"}</b><span>Use the + control beside a changed line to attach a precise fix reference.</span></div>
+                <button className={styles.sendReviewButton} disabled={!pendingReviewComments.length || !state.worktree || !state.provider || !state.modelId || !!busy} onClick={sendReviewComments}>{busy === "review-comments" ? "SENDING TO AGENT…" : `SEND ${pendingReviewComments.length || ""} TO AGENT`}</button>
+              </div>
+              <div className={styles.approvalNote}>{state.approvalToken ? <span className={styles.approvedState}>✓ Approval is bound to the selected file contents for 30 minutes.</span> : <span>Select files, inspect their patches, then approve their exact contents before commit is enabled.</span>}</div>
+              <div className={styles.gitGates}>
+                <button disabled={!state.selectedFiles.length || !!busy} onClick={() => gitAction("approve")}>1 · APPROVE FILES FOR COMMIT</button>
+                <button disabled={!state.approvalToken || !!busy} onClick={() => gitAction("commit", { message: `${task.key}: ${task.summary}` })}>2 · COMMIT APPROVED FILES</button>
+                <button disabled={!state.worktree || !!busy} onClick={() => gitAction("push")}>3 · PUSH BRANCH</button>
+                <div className={styles.prSplit}><button disabled={!state.worktree || !!busy} onClick={() => gitAction("pr", { draft: true })}>4A · OPEN DRAFT PR</button><button disabled={!state.worktree || !!busy} onClick={() => gitAction("pr", { draft: false })}>4B · OPEN READY PR</button></div>
+              </div>
+            </section>
+
             <section className={styles.panel}>
               <div className={styles.panelHead}><span>AUTONOMOUS WORK</span><small>PI SESSION · NO GIT WRITES</small></div>
-              <div className={styles.actionGrid}>{["Plan", "Develop", "Pre-commit", "Deep review", "PR review"].map((step) => <button key={step} disabled={!state.worktree || !!busy} onClick={() => runPiAction(step)}><span>{step}</span><small>{step === "PR review" ? "approval-gated" : "launch agent"}</small></button>)}</div>
+              <div className={styles.actionGrid}>{AGENT_STEPS.map((step) => <button key={step} disabled={!state.worktree || !!busy} onClick={() => runPiAction(step)}><span>{step}</span><small>{step === "PR review" ? "approval-gated" : "launch agent"}</small></button>)}</div>
             </section>
 
             <section className={styles.panel}>
@@ -397,23 +844,19 @@ export function SprintPilot() {
               <button className={styles.primary} disabled={!state.testFile || !!busy} onClick={runTest}>{busy === "test" ? "RUNNING…" : "RUN SELECTED TEST"}</button>
             </section>
 
-            <section className={`${styles.panel} ${styles.changesPanel}`}>
-              <div className={styles.panelHead}><span>PENDING CHANGES</span><small>{gitFiles.length} FILES · APPROVAL BOUND TO CONTENT</small></div>
-              <div className={styles.changeLayout}><div className={styles.fileList}>{gitFiles.length ? gitFiles.map((file) => {
-                const relative = state.worktree ? file.filePath.replace(`${state.worktree}/`, "") : file.filePath;
-                return <label key={file.filePath}><input type="checkbox" checked={state.selectedFiles.includes(relative)} onChange={(event) => updateRuntime({ approvalToken: undefined, selectedFiles: event.target.checked ? [...state.selectedFiles, relative] : state.selectedFiles.filter((item) => item !== relative) })}/><button onClick={() => inspectDiff(file)}><b>{file.status.slice(0, 1).toUpperCase()}</b><span>{relative}</span></button></label>;
-              }) : <p className={styles.empty}>No pending changes detected.</p>}</div><pre className={styles.diff}>{diff}</pre></div>
-              <div className={styles.gitGates}>
-                <button disabled={!state.selectedFiles.length || !!busy} onClick={() => gitAction("approve")}>1 · APPROVE SELECTED</button>
-                <button disabled={!state.approvalToken || !!busy} onClick={() => gitAction("commit", { message: `${task.key}: ${task.summary}` })}>2 · COMMIT</button>
-                <button disabled={!state.worktree || !!busy} onClick={() => gitAction("push")}>3 · PUSH BRANCH</button>
-                <div className={styles.prSplit}><button disabled={!state.worktree || !!busy} onClick={() => gitAction("pr", { draft: true })}>4A · OPEN DRAFT PR</button><button disabled={!state.worktree || !!busy} onClick={() => gitAction("pr", { draft: false })}>4B · OPEN READY PR</button></div>
-              </div>
-            </section>
           </div>
         </>}
       </section>
     </div>
+    {restartStep && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setRestartStep(null); }}>
+      <section className={styles.modal} role="alertdialog" aria-modal="true" aria-labelledby="restart-step-title">
+        <span className={styles.modalKicker}>COMPLETED STEP</span>
+        <h2 id="restart-step-title">Start a new {restartStep} session?</h2>
+        <p>{restartStep} is already marked complete for {task?.key}. Starting again creates a separate Pi session and keeps the step completed.</p>
+        {!state.worktree && <p className={styles.authError}>Create the task worktree before starting a Pi session.</p>}
+        <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setRestartStep(null)}>CANCEL</button><button className={styles.primary} disabled={!state.worktree || !state.provider || !state.modelId || !!busy} onClick={restartCompletedStep}>START NEW SESSION</button></div>
+      </section>
+    </div>}
     {deleteTarget && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setDeleteTarget(null); }}>
       <section className={styles.modal} role="alertdialog" aria-modal="true" aria-labelledby="delete-worktree-title">
         <span className={styles.modalKicker}>DESTRUCTIVE ACTION</span>
@@ -421,6 +864,21 @@ export function SprintPilot() {
         <p>This removes the worktree directory but keeps its Git branch. Git will refuse deletion if the worktree has uncommitted changes.</p>
         <code>{deleteTarget.worktree}</code>
         <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setDeleteTarget(null)}>CANCEL</button><button className={styles.danger} disabled={!!busy} onClick={deleteWorktree}>{busy === "delete-worktree" ? "DELETING…" : "YES, DELETE WORKTREE"}</button></div>
+      </section>
+    </div>}
+    {linkSetup && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setLinkSetup(null); }}>
+      <section className={`${styles.modal} ${styles.linkModal}`} role="dialog" aria-modal="true" aria-labelledby="link-worktree-title">
+        <span className={styles.modalKicker}>EXISTING WORKTREE</span>
+        <h2 id="link-worktree-title">Link a worktree to {linkSetup.key}?</h2>
+        <p>SprintPilot scanned registered Git worktrees under <strong>~/git</strong>. Choose a match to use for this task. Linking does not change Git.</p>
+        {linkSetup.loading && <p className={styles.scanProgress}>● SCANNING ~/git…</p>}
+        {linkSetup.error && <p className={styles.authError}>{linkSetup.error}</p>}
+        {!linkSetup.loading && !linkSetup.error && linkSetup.candidates.length === 0 && <p>No registered worktree matching {linkSetup.key} was found under ~/git.</p>}
+        <div className={styles.candidateList}>{linkSetup.candidates.map((candidate) => <label className={styles.candidateOption} key={candidate.worktree}>
+          <input type="radio" name="existing-worktree" value={candidate.worktree} checked={linkSetup.selected === candidate.worktree} onChange={() => setLinkSetup({ ...linkSetup, selected: candidate.worktree, error: undefined })}/>
+          <span><strong>{candidate.branch || "Detached HEAD"}</strong><code>{candidate.worktree}</code></span>
+        </label>)}</div>
+        <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setLinkSetup(null)}>CANCEL</button><button className={styles.primary} disabled={!linkSetup.selected || linkSetup.loading || !!busy} onClick={linkExistingWorktree}>{busy === "link-worktree" ? "LINKING…" : "LINK WORKTREE"}</button></div>
       </section>
     </div>}
     {authSetup && <div className={styles.modalBackdrop} role="presentation">
@@ -447,6 +905,6 @@ export function SprintPilot() {
         </div>
       </section>
     </div>}
-    <footer className={styles.console}><span>EVENT LOG</span><pre>{notice}</pre><b>{busy ? `RUNNING ${busy.toUpperCase()}` : "IDLE"}</b></footer>
+    {(notice || busy) && <div className={styles.noticeToast} role="status"><span>{busy ? `● RUNNING ${busy.toUpperCase()}` : notice}</span>{notice && !busy && <button aria-label="Dismiss notification" onClick={() => setNotice("")}>×</button>}</div>}
   </main>;
 }
