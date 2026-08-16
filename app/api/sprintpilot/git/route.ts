@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { assertSprintWorktree, createApproval, run, snapshotChanges, takeApproval } from "@/lib/sprintpilot-server";
+import { buildSprintPilotCommitMessage } from "@/lib/sprintpilot-commit-message";
+import { assertSprintWorktree, createApproval, readApproval, run, snapshotChanges, takeApproval } from "@/lib/sprintpilot-server";
 
 export async function POST(request: Request) {
   try {
@@ -10,6 +11,15 @@ export async function POST(request: Request) {
     if (action === "approve") {
       const snapshot = await snapshotChanges(cwd, body.files);
       return NextResponse.json({ approvalToken: createApproval(cwd, snapshot.files, snapshot.hash), hash: snapshot.hash });
+    }
+
+    if (action === "commit-message") {
+      const approval = readApproval(body.approvalToken);
+      if (approval.cwd !== cwd) throw new Error("Approval belongs to another worktree");
+      const current = await snapshotChanges(cwd, approval.files);
+      if (current.hash !== approval.hash) throw new Error("Changes moved since approval; review and approve them again");
+      const patch = await run("git", ["diff", "--no-ext-diff", "HEAD", "--", ...approval.files], cwd);
+      return NextResponse.json({ message: buildSprintPilotCommitMessage(String(body.title || ""), approval.files, patch) });
     }
 
     if (action === "commit") {

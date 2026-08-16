@@ -96,3 +96,13 @@ export function takeApproval(token: unknown): Approval {
   if (!approval || approval.expiresAt < Date.now()) throw new Error("Approval expired; review the changes again");
   return approval;
 }
+
+export function readApproval(token: unknown): Approval {
+  if (typeof token !== "string") throw new Error("Approval token is required");
+  const approval = approvals().get(token);
+  if (!approval || approval.expiresAt < Date.now()) {
+    if (approval) approvals().delete(token);
+    throw new Error("Approval expired; review the changes again");
+  }
+  return approval;
+}

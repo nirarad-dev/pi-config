@@ -4,33 +4,86 @@ export type ProviderUsage = {
   updatedAt?: string;
 };
 
-export type ClaudeRateLimits = {
+export type ProviderRateLimits = {
   fiveHour?: { usedPercentage: number; resetsAt?: string };
   weekly?: { usedPercentage: number; resetsAt?: string };
   fetchedAt: string;
 };
 
+export type ClaudeRateLimits = ProviderRateLimits;
+
 export type SprintPilotUsage = {
-  claude: ProviderUsage & { rateLimits?: ClaudeRateLimits };
-  codex: ProviderUsage;
+  claude: ProviderUsage & { rateLimits?: ProviderRateLimits };
+  codex: ProviderUsage & { rateLimits?: ProviderRateLimits };
 };
 
 function usageWindow(value: unknown) {
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
-  const usedPercentage = Number(record.utilization ?? record.used_percentage);
+  const usedPercentage = Number(record.percent ?? record.utilization ?? record.used_percentage ?? record.used_percent);
   if (!Number.isFinite(usedPercentage)) return undefined;
-  const resetsAt = typeof record.resets_at === "string" ? record.resets_at : undefined;
+  const rawReset = record.resets_at;
+  const resetsAt = typeof rawReset === "string" ? rawReset
+    : typeof rawReset === "number" && Number.isFinite(rawReset) ? new Date(rawReset * 1000).toISOString()
+      : undefined;
   return { usedPercentage: Math.max(0, Math.min(100, usedPercentage)), ...(resetsAt ? { resetsAt } : {}) };
 }
 
 export function normalizeClaudeRateLimits(value: unknown, fetchedAt = new Date().toISOString()): ClaudeRateLimits | undefined {
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
-  const fiveHour = usageWindow(record.five_hour);
-  const weekly = usageWindow(record.seven_day);
+  const limits = Array.isArray(record.limits) ? record.limits.filter((limit): limit is Record<string, unknown> => !!limit && typeof limit === "object") : [];
+  const activeSession = limits.find((limit) => limit.kind === "session" && limit.is_active === true)
+    ?? limits.find((limit) => limit.kind === "session");
+  const activeWeekly = limits.find((limit) => limit.kind === "weekly_all" && limit.is_active === true)
+    ?? limits.find((limit) => limit.kind === "weekly_all");
+  const fiveHour = usageWindow(activeSession ?? record.five_hour);
+  const weekly = usageWindow(activeWeekly ?? record.seven_day);
   if (!fiveHour && !weekly) return undefined;
   return { ...(fiveHour ? { fiveHour } : {}), ...(weekly ? { weekly } : {}), fetchedAt };
+}
+
+function codexWindow(value: unknown): { minutes: number; window: { usedPercentage: number; resetsAt?: string } } | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const minutes = Number(record.window_minutes);
+  const window = usageWindow(record);
+  return Number.isFinite(minutes) && window ? { minutes, window } : undefined;
+}
+
+export function normalizeCodexRateLimits(value: unknown, fetchedAt = new Date().toISOString()): ProviderRateLimits | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const windows = [codexWindow(record.primary), codexWindow(record.secondary)].filter((window): window is NonNullable<typeof window> => !!window);
+  if (!windows.length) return undefined;
+  const fiveHour = windows.find((window) => window.minutes <= 6 * 60)?.window;
+  const weekly = windows.find((window) => window.minutes >= 6 * 24 * 60)?.window;
+  return { ...(fiveHour ? { fiveHour } : {}), ...(weekly ? { weekly } : {}), fetchedAt };
+}
+
+export function latestCodexRateLimits(contents: readonly string[]): ProviderRateLimits | undefined {
+  let latestTimestamp = 0;
+  let latest: ProviderRateLimits | undefined;
+  for (const content of contents) {
+    for (const line of content.split("\n")) {
+      if (!line.includes('"rate_limits"')) continue;
+      try {
+        const entry = JSON.parse(line) as Record<string, unknown>;
+        const payload = entry.payload && typeof entry.payload === "object" ? entry.payload as Record<string, unknown> : undefined;
+        const timestamp = Date.parse(String(entry.timestamp || ""));
+        const limits = payload?.rate_limits;
+        if (payload?.type !== "token_count" || !Number.isFinite(timestamp) || timestamp < latestTimestamp) continue;
+        const normalized = normalizeCodexRateLimits(limits, new Date(timestamp).toISOString());
+        if (normalized) {
+          latestTimestamp = timestamp;
+          latest = normalized;
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+  return latest;
 }
 
 function providerBucket(provider: unknown): keyof SprintPilotUsage | undefined {

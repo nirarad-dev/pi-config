@@ -6,11 +6,16 @@ import { vscDarkPlus } from "react-syntax-highlighter/dist/cjs/styles/prism";
 import { completedStepsForJiraStatus, normalizeCompletedSteps, TEST_PRESETS, WORKFLOW_STEPS, type ModelEntry, type SprintTask, type WorkflowStep } from "@/lib/sprintpilot-config";
 import { buildSprintPilotChangeTree, type SprintPilotChangeTreeNode } from "@/lib/sprintpilot-change-tree";
 import { parseDiff } from "@/lib/sprintpilot-diff";
+import type { SprintPilotHistoryLine } from "@/lib/sprintpilot-git-history";
+import { sprintPilotDiffTokenStyles } from "@/lib/sprintpilot-highlight";
 import { buildReviewFixPrompt, type ReviewComment } from "@/lib/sprintpilot-review";
 import { sprintPilotDiffLanguage } from "@/lib/sprintpilot-syntax";
-import type { ProviderUsage, SprintPilotUsage } from "@/lib/sprintpilot-usage";
+import type { ProviderRateLimits, SprintPilotUsage } from "@/lib/sprintpilot-usage";
 import { FolderIcon, getFileIcon } from "./FileIcons";
 import styles from "./SprintPilot.module.css";
+
+const SPRINTPILOT_DIFF_THEME = { ...vscDarkPlus, ...sprintPilotDiffTokenStyles };
+const HISTORY_PAGE_SIZE = 200;
 
 type ModelResponse = {
   modelList?: ModelEntry[];
@@ -38,6 +43,7 @@ type AuthSetup = {
   input?: string;
   options?: { id: string; label: string }[];
 };
+type CommitSetup = { phase: "loading" | "ready" | "error"; message: string; error?: string };
 type TaskRuntime = {
   worktree?: string;
   branch?: string;
@@ -97,24 +103,32 @@ function preferredEffort(levels: Record<string, string[]>, model: ModelEntry) {
   return supported.includes(DEFAULT_EFFORT) ? DEFAULT_EFFORT : supported[0];
 }
 
-function compactTokens(tokens: number) {
-  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(tokens >= 10_000_000 ? 0 : 1)}M`;
-  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(tokens >= 100_000 ? 0 : 1)}K`;
-  return String(tokens);
-}
-
-function UsageBadge({ label, usage }: { label: string; usage?: ProviderUsage }) {
-  return <span className={styles.usageBadge}><b>{label}</b><strong>{usage ? compactTokens(usage.tokens) : "—"}</strong><small>TOK · {usage?.turns ?? "—"} TURNS</small></span>;
-}
-
-function ClaudeUsageBadge({ usage }: { usage?: SprintPilotUsage["claude"] }) {
-  const limits = usage?.rateLimits;
+function RateLimitBadge({ label, limits }: { label: string; limits?: ProviderRateLimits }) {
   const percentage = (value?: number) => value === undefined ? "—" : `${Math.round(value)}%`;
+  const reset = (value?: string) => value ? new Date(value).toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" }) : "No reset data";
   return <span className={styles.claudeUsageBadge}>
-    <b>CLAUDE</b>
-    <span title={limits?.fiveHour?.resetsAt ? `Resets ${new Date(limits.fiveHour.resetsAt).toLocaleString()}` : undefined}><small>5H</small><strong>{percentage(limits?.fiveHour?.usedPercentage)}</strong></span>
-    <span title={limits?.weekly?.resetsAt ? `Resets ${new Date(limits.weekly.resetsAt).toLocaleString()}` : undefined}><small>WEEK</small><strong>{percentage(limits?.weekly?.usedPercentage)}</strong></span>
+    <b>{label}</b>
+    <span title={`Resets ${reset(limits?.fiveHour?.resetsAt)}`}><small>5H</small><strong>{percentage(limits?.fiveHour?.usedPercentage)}</strong></span>
+    <span title={`Resets ${reset(limits?.weekly?.resetsAt)}`}><small>WEEK</small><strong>{percentage(limits?.weekly?.usedPercentage)}</strong></span>
   </span>;
+}
+
+function HistoryGraph({ lines, hasMore, loading, onLoadMore }: { lines: SprintPilotHistoryLine[]; hasMore: boolean; loading: boolean; onLoadMore: () => void }) {
+  if (!lines.length) return <div className={styles.historyEmpty}>No commits are reachable from this worktree yet.</div>;
+
+  return <div className={styles.historyGraph} role="list" aria-label="Git commit history">
+    {lines.map((line, index) => line.kind === "connector"
+      ? <div className={styles.historyConnector} aria-hidden="true" key={`connector-${index}`}><pre>{line.graph}</pre></div>
+      : <div className={styles.historyCommit} role="listitem" key={`${line.hash}-${index}`} title={line.hash}>
+          <pre className={styles.historyTopology} aria-hidden="true">{line.graph}</pre>
+          <code>{line.shortHash}</code>
+          <div className={styles.historyIdentity}>
+            <span><b>{line.subject}</b>{line.refs.map((ref) => <em className={ref.startsWith("HEAD") ? styles.historyHeadRef : ref.startsWith("tag:") ? styles.historyTagRef : ""} key={ref}>{ref}</em>)}</span>
+            <small>{line.author} · {new Date(line.authoredAt).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}{line.parents.length > 1 ? ` · merge of ${line.parents.length}` : ""}</small>
+          </div>
+        </div>)}
+    {hasMore && <button className={styles.historyMore} disabled={loading} onClick={onLoadMore}>{loading ? "LOADING…" : "LOAD 200 MORE COMMITS"}</button>}
+  </div>;
 }
 
 function fileParts(filePath: string) {
@@ -173,7 +187,7 @@ function HighlightedDiffCode({ text, language }: { text: string; language?: stri
   if (!language) return <code>{text || " "}</code>;
   return <SyntaxHighlighter
     language={language}
-    style={vscDarkPlus}
+    style={SPRINTPILOT_DIFF_THEME}
     PreTag="code"
     CodeTag="span"
     className={styles.diffSyntax}
@@ -301,6 +315,8 @@ async function jsonRequest<T>(url: string, init?: RequestInit): Promise<T> {
 export function SprintPilot() {
   const [tasks, setTasks] = useState<SprintTask[]>(DEMO_TASKS);
   const [jiraConfigured, setJiraConfigured] = useState(false);
+  const [jiraRefreshing, setJiraRefreshing] = useState(false);
+  const [lastJiraSync, setLastJiraSync] = useState<Date>();
   const [openKeys, setOpenKeys] = useState<string[]>([DEMO_TASKS[0].key]);
   const [activeKey, setActiveKey] = useState(DEMO_TASKS[0].key);
   const [runtime, setRuntime] = useState<Record<string, TaskRuntime>>({ [DEMO_TASKS[0].key]: initialRuntime() });
@@ -312,6 +328,10 @@ export function SprintPilot() {
   const [testFiles, setTestFiles] = useState<string[]>([]);
   const [diff, setDiff] = useState("");
   const [activeDiffFile, setActiveDiffFile] = useState<string>();
+  const [historyLines, setHistoryLines] = useState<SprintPilotHistoryLine[]>([]);
+  const [historyCommitCount, setHistoryCommitCount] = useState(0);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [collapsedChangeFolders, setCollapsedChangeFolders] = useState<Set<string>>(() => new Set());
   const [developmentOpen, setDevelopmentOpen] = useState(true);
   const [notice, setNotice] = useState("");
@@ -320,7 +340,9 @@ export function SprintPilot() {
   const [linkSetup, setLinkSetup] = useState<LinkSetup | null>(null);
   const [restartStep, setRestartStep] = useState<WorkflowStep | null>(null);
   const [authSetup, setAuthSetup] = useState<AuthSetup | null>(null);
+  const [commitSetup, setCommitSetup] = useState<CommitSetup | null>(null);
   const authEvents = useRef<EventSource | null>(null);
+  const jiraSyncing = useRef(false);
 
   const task = tasks.find((candidate) => candidate.key === activeKey) || tasks[0];
   const storedState = runtime[activeKey] || initialRuntime();
@@ -343,23 +365,49 @@ export function SprintPilot() {
     });
   }, [activeKey]);
 
+  const syncJiraTasks = useCallback(async ({ announce = false, worktrees = [] }: {
+    announce?: boolean;
+    worktrees?: { key: string; worktree: string; branch?: string }[];
+  } = {}) => {
+    if (jiraSyncing.current) return;
+    jiraSyncing.current = true;
+    setJiraRefreshing(true);
+    try {
+      const jira = await jsonRequest<{ configured: boolean; tasks: SprintTask[] }>("/api/sprintpilot/tasks");
+      setJiraConfigured(jira.configured);
+      const loadedTasks = jira.configured ? jira.tasks.filter((loadedTask) => !isCompletedTask(loadedTask)) : DEMO_TASKS;
+      const validKeys = new Set(loadedTasks.map((loadedTask) => loadedTask.key));
+      const worktreesByKey = new Map(worktrees.map((entry) => [entry.key, entry]));
+      setTasks(loadedTasks);
+      setOpenKeys((current) => {
+        const retained = current.filter((key) => validKeys.has(key));
+        return retained.length ? retained : loadedTasks[0] ? [loadedTasks[0].key] : [];
+      });
+      setActiveKey((current) => validKeys.has(current) ? current : loadedTasks[0]?.key || "");
+      setRuntime((current) => Object.fromEntries(loadedTasks.map((loadedTask) => {
+        const existing = current[loadedTask.key] || initialRuntime();
+        return [loadedTask.key, {
+          ...existing,
+          ...worktreesByKey.get(loadedTask.key),
+          completed: normalizeCompletedSteps(
+            completedStepsForJiraStatus(loadedTask.status),
+            existing.completed.length ? existing.completed : storedCompletedSteps(loadedTask.key),
+          ),
+        }];
+      })));
+      setLastJiraSync(new Date());
+      if (announce) setNotice(`Jira synchronized. ${loadedTasks.length} active ${loadedTasks.length === 1 ? "ticket" : "tickets"} loaded.`);
+    } catch (error) {
+      if (announce) setNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      jiraSyncing.current = false;
+      setJiraRefreshing(false);
+    }
+  }, []);
+
   useEffect(() => {
-    Promise.all([
-      jsonRequest<{ configured: boolean; tasks: SprintTask[] }>("/api/sprintpilot/tasks"),
-      jsonRequest<{ worktrees: { key: string; worktree: string; branch?: string }[] }>("/api/sprintpilot/worktree"),
-    ]).then(([jira, worktreeData]) => {
-        setJiraConfigured(jira.configured);
-        const loadedTasks = jira.configured ? jira.tasks.filter((loadedTask) => !isCompletedTask(loadedTask)) : DEMO_TASKS;
-        const worktrees = new Map(worktreeData.worktrees.map((entry) => [entry.key, entry]));
-        setTasks(loadedTasks);
-        setOpenKeys(loadedTasks[0] ? [loadedTasks[0].key] : []);
-        if (loadedTasks[0]) setActiveKey(loadedTasks[0].key);
-        setRuntime(Object.fromEntries(loadedTasks.map((loadedTask) => [loadedTask.key, {
-          ...initialRuntime(),
-          ...worktrees.get(loadedTask.key),
-          completed: normalizeCompletedSteps(completedStepsForJiraStatus(loadedTask.status), storedCompletedSteps(loadedTask.key)),
-        }])));
-      })
+    jsonRequest<{ worktrees: { key: string; worktree: string; branch?: string }[] }>("/api/sprintpilot/worktree")
+      .then((worktreeData) => syncJiraTasks({ worktrees: worktreeData.worktrees }))
       .catch((error) => setNotice(error.message));
     jsonRequest<{ providers: AuthProvider[] }>("/api/auth/providers")
       .then((data) => setAuthProviders(data.providers))
@@ -385,7 +433,14 @@ export function SprintPilot() {
       })
       .catch((error) => setNotice(error.message));
     return () => authEvents.current?.close();
-  }, []);
+  }, [syncJiraTasks]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void syncJiraTasks();
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, [syncJiraTasks]);
 
   useEffect(() => {
     const refreshUsage = () => jsonRequest<{ usage: SprintPilotUsage }>("/api/sprintpilot/usage")
@@ -462,9 +517,31 @@ export function SprintPilot() {
     }
   }, [state.worktree, state.selectedFiles, updateRuntime]);
 
+  const refreshHistory = useCallback(async (skip = 0, append = false) => {
+    if (!state.worktree) {
+      setHistoryLines([]);
+      setHistoryCommitCount(0);
+      setHistoryHasMore(false);
+      return;
+    }
+    setHistoryLoading(true);
+    try {
+      const result = await jsonRequest<{ lines: SprintPilotHistoryLine[]; totalCommitCount: number; hasMore: boolean }>(`/api/sprintpilot/git/history?cwd=${encodeURIComponent(state.worktree)}&skip=${skip}&limit=${HISTORY_PAGE_SIZE}`);
+      setHistoryLines((current) => append ? [...current, ...result.lines] : result.lines);
+      setHistoryCommitCount(result.totalCommitCount);
+      setHistoryHasMore(result.hasMore);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [state.worktree]);
+
   useEffect(() => {
     refreshWorkspace().catch((error) => setNotice(error.message));
   }, [refreshWorkspace, activeKey]);
+
+  useEffect(() => {
+    refreshHistory().catch((error) => setNotice(error.message));
+  }, [refreshHistory, activeKey]);
 
   useEffect(() => {
     setActiveDiffFile(undefined);
@@ -682,12 +759,40 @@ export function SprintPilot() {
         body: JSON.stringify({ action, cwd: state.worktree, files: state.selectedFiles, approvalToken: state.approvalToken, title: `${task.key}: ${task.summary}`, ...extra }),
       });
       if (action === "approve") updateRuntime({ approvalToken: result.approvalToken, completed: normalizeCompletedSteps(state.completed, ["Approve"]) });
-      if (action === "commit") updateRuntime({ approvalToken: undefined, completed: normalizeCompletedSteps(state.completed, ["Commit"]) });
+      if (action === "commit") {
+        setCommitSetup(null);
+        setActiveDiffFile(undefined);
+        setDiff("");
+        updateRuntime({ approvalToken: undefined, selectedFiles: [], completed: normalizeCompletedSteps(state.completed, ["Commit"]) });
+        const refreshes = await Promise.allSettled([refreshWorkspace(), refreshHistory(0)]);
+        const refreshFailure = refreshes.find((refresh) => refresh.status === "rejected");
+        if (refreshFailure?.status === "rejected") {
+          setNotice(`Commit complete, but the workspace refresh failed: ${refreshFailure.reason instanceof Error ? refreshFailure.reason.message : String(refreshFailure.reason)}`);
+          return;
+        }
+      }
       if (action === "push") updateRuntime({ completed: normalizeCompletedSteps(state.completed, ["Push"]) });
       if (action === "pr") updateRuntime({ completed: normalizeCompletedSteps(state.completed, ["Open PR"]) });
       setNotice(result.url || result.output || (action === "approve" ? "Selection approved. The token expires in 30 minutes and becomes invalid if any selected file changes." : `${action} complete.`));
     } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
     finally { setBusy(null); }
+  };
+
+  const prepareCommit = async () => {
+    if (!state.worktree || !state.approvalToken || !task) return;
+    setCommitSetup({ phase: "loading", message: "" });
+    setBusy("commit-message");
+    try {
+      const result = await jsonRequest<{ message: string }>("/api/sprintpilot/git", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "commit-message", cwd: state.worktree, approvalToken: state.approvalToken, title: `${task.key}: ${task.summary}` }),
+      });
+      setCommitSetup({ phase: "ready", message: result.message });
+    } catch (error) {
+      setCommitSetup({ phase: "error", message: "", error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setBusy(null);
+    }
   };
 
   const providerGroups = useMemo(() => [...new Set(models.map((model) => model.provider))], [models]);
@@ -719,7 +824,7 @@ export function SprintPilot() {
           <div className={styles.providerPopover}>
             <div className={styles.providerStatus}><span><i className={claudeConnected ? styles.statusOnline : styles.statusOffline}/>CLAUDE</span><b>{claudeConnected ? "CONNECTED" : "OFFLINE"}</b></div>
             <div className={styles.providerStatus}><span><i className={codexConnected ? styles.statusOnline : styles.statusOffline}/>CODEX</span><b>{codexConnected ? "CONNECTED" : "OFFLINE"}</b></div>
-            <div className={styles.usageRail} aria-label="Provider usage"><span className={styles.usageWindow}>USAGE</span><ClaudeUsageBadge usage={providerUsage?.claude}/><UsageBadge label="CODEX" usage={providerUsage?.codex}/></div>
+            <div className={styles.usageRail} aria-label="Provider rate-limit usage"><span className={styles.usageWindow}>LIMITS</span><RateLimitBadge label="CLAUDE" limits={providerUsage?.claude.rateLimits}/><RateLimitBadge label="CODEX" limits={providerUsage?.codex.rateLimits}/></div>
             <a className={styles.providerConsoleLink} href="/chat">MODEL AUTH &amp; PI CONSOLE ↗</a>
           </div>
         </details>
@@ -729,6 +834,7 @@ export function SprintPilot() {
     <div className={styles.layout}>
       <aside className={styles.sidebar}>
         <div className={styles.sectionLabel}>CURRENT SPRINT <span>{tasks.length}</span></div>
+        <div className={styles.jiraSyncBar}><button disabled={jiraRefreshing} onClick={() => syncJiraTasks({ announce: true })}><span aria-hidden="true">↻</span>{jiraRefreshing ? "SYNCING JIRA…" : "REFRESH JIRA"}</button><small title={lastJiraSync ? `Last synced ${lastJiraSync.toLocaleString()}` : "Waiting for first sync"}>AUTO · 1 MIN{lastJiraSync ? ` · ${lastJiraSync.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}</small></div>
         {!jiraConfigured && <p className={styles.jiraWarning}><b>DEMO DATA</b> Jira is not connected. Copy <code>sprintpilot.env.example</code> to <code>.env.local</code>, add your Jira email and API token, then restart the app.</p>}
         <div className={styles.taskList}>{tasks.map((item) => <button key={item.key} className={`${styles.taskCard} ${item.key === activeKey ? styles.activeTask : ""}`} onClick={() => openTask(item.key)}>
           <span className={styles.taskMeta}><span className={styles.keyIdentity}><IssueTypeIcon type={item.issueType}/><b>{item.key}</b><small>{item.issueType || "Task"}</small></span><i>{item.priority}</i></span>
@@ -818,10 +924,16 @@ export function SprintPilot() {
               <div className={styles.approvalNote}>{state.approvalToken ? <span className={styles.approvedState}>✓ Approval is bound to the selected file contents for 30 minutes.</span> : <span>Select files, inspect their patches, then approve their exact contents before commit is enabled.</span>}</div>
               <div className={styles.gitGates}>
                 <button disabled={!state.selectedFiles.length || !!busy} onClick={() => gitAction("approve")}>1 · APPROVE FILES FOR COMMIT</button>
-                <button disabled={!state.approvalToken || !!busy} onClick={() => gitAction("commit", { message: `${task.key}: ${task.summary}` })}>2 · COMMIT APPROVED FILES</button>
+                <button disabled={!state.approvalToken || !!busy} onClick={prepareCommit}>2 · REVIEW COMMIT MESSAGE</button>
                 <button disabled={!state.worktree || !!busy} onClick={() => gitAction("push")}>3 · PUSH BRANCH</button>
                 <div className={styles.prSplit}><button disabled={!state.worktree || !!busy} onClick={() => gitAction("pr", { draft: true })}>4A · OPEN DRAFT PR</button><button disabled={!state.worktree || !!busy} onClick={() => gitAction("pr", { draft: false })}>4B · OPEN READY PR</button></div>
               </div>
+            </section>
+
+            <section className={`${styles.panel} ${styles.historyPanel}`}>
+              <div className={styles.panelHead}><span>GIT HISTORY</span><small>{historyLoading ? "READING REPOSITORY…" : `${historyCommitCount} COMMITS · ALL REFS`}</small></div>
+              <div className={styles.historyToolbar}><span>BRANCHES, MERGES, TAGS &amp; REMOTES</span><button disabled={!state.worktree || historyLoading} onClick={() => refreshHistory(0).catch((error) => setNotice(error.message))}>{historyLoading ? "REFRESHING…" : "REFRESH HISTORY"}</button></div>
+              <HistoryGraph lines={historyLines} hasMore={historyHasMore} loading={historyLoading} onLoadMore={() => refreshHistory(historyLines.filter((line) => line.kind === "commit").length, true).catch((error) => setNotice(error.message))}/>
             </section>
 
             <section className={styles.panel}>
@@ -855,6 +967,17 @@ export function SprintPilot() {
         <p>{restartStep} is already marked complete for {task?.key}. Starting again creates a separate Pi session and keeps the step completed.</p>
         {!state.worktree && <p className={styles.authError}>Create the task worktree before starting a Pi session.</p>}
         <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setRestartStep(null)}>CANCEL</button><button className={styles.primary} disabled={!state.worktree || !state.provider || !state.modelId || !!busy} onClick={restartCompletedStep}>START NEW SESSION</button></div>
+      </section>
+    </div>}
+    {commitSetup && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setCommitSetup(null); }}>
+      <section className={`${styles.modal} ${styles.commitModal}`} role="dialog" aria-modal="true" aria-labelledby="commit-message-title">
+        <span className={styles.modalKicker}>APPROVED SNAPSHOT</span>
+        <h2 id="commit-message-title">Review commit message</h2>
+        <p>The draft was generated from the exact files you approved. Edit it before committing if needed.</p>
+        {commitSetup.phase === "loading" && <p className={styles.commitScan}>● SCANNING APPROVED CODE…</p>}
+        {commitSetup.phase === "error" && <p className={styles.authError}>{commitSetup.error}</p>}
+        {commitSetup.phase === "ready" && <label>SUBJECT &amp; BODY<textarea autoFocus value={commitSetup.message} onChange={(event) => setCommitSetup({ ...commitSetup, message: event.target.value })}/></label>}
+        <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setCommitSetup(null)}>CANCEL</button><button className={styles.primary} disabled={commitSetup.phase !== "ready" || !commitSetup.message.trim() || !!busy} onClick={() => gitAction("commit", { message: commitSetup.message })}>{busy === "commit" ? "COMMITTING…" : "COMMIT APPROVED FILES"}</button></div>
       </section>
     </div>}
     {deleteTarget && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setDeleteTarget(null); }}>
