@@ -56,11 +56,28 @@ type AutoNameStatus =
 const TOP_BAR_ICON_BUTTON_SIZE = 36;
 const LANGUAGE_MENU_WIDTH = 176;
 
+export function piChatPath(sessionId?: string, options: { embedded?: boolean; sprintPilotPalette?: boolean; scopeCwd?: string | null } = {}) {
+  const params = new URLSearchParams();
+  if (sessionId) params.set("session", sessionId);
+  if (options.embedded) params.set("embedded", "1");
+  if (options.sprintPilotPalette) params.set("palette", "sprintpilot");
+  if (options.scopeCwd) params.set("scopeCwd", options.scopeCwd);
+  const query = params.toString();
+  return `/chat${query ? `?${query}` : ""}`;
+}
+
 export function AppShell() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const embedded = searchParams.get("embedded") === "1";
   const sprintPilotEmbedded = embedded && searchParams.get("palette") === "sprintpilot";
+  const sessionScopeCwd = searchParams.get("scopeCwd")?.trim() || null;
+  const embeddedSessionSidebar = embedded && Boolean(sessionScopeCwd);
+  const currentChatPath = useCallback((sessionId?: string) => piChatPath(sessionId, {
+    embedded,
+    sprintPilotPalette: sprintPilotEmbedded,
+    scopeCwd: sessionScopeCwd,
+  }), [embedded, sprintPilotEmbedded, sessionScopeCwd]);
   const [initialNavigation] = useState(() => getInitialNavigation(searchParams));
   const { preference, toggleTheme } = useTheme();
   const themeLabelKey =
@@ -103,7 +120,7 @@ export function AppShell() {
   const [projectTrustDialogOpen, setProjectTrustDialogOpen] = useState(false);
   const [projectTrustBusy, setProjectTrustBusy] = useState(false);
   const [projectTrustError, setProjectTrustError] = useState<string | null>(null);
-  const [sidebarOpen, setSidebarOpen] = useState(!embedded);
+  const [sidebarOpen, setSidebarOpen] = useState(!embedded || embeddedSessionSidebar);
   const [rightPanelOpen, setRightPanelOpen] = useState(false);
   const [mobileToolbarMoreOpen, setMobileToolbarMoreOpen] = useState(false);
   const [mobileSidebarReady, setMobileSidebarReady] = useState(false);
@@ -450,13 +467,13 @@ export function AppShell() {
         setSelectedSession(s);
         setSessionKey((k) => k + 1);
         if (new URLSearchParams(window.location.search).get("session") !== s.id) {
-          router.replace(`?session=${encodeURIComponent(s.id)}`, { scroll: false });
+          router.replace(currentChatPath(s.id), { scroll: false });
         }
       })
       .catch(() => {
         // Network hiccup: keep the remembered session for a later retry.
       });
-  }, [router]);
+  }, [currentChatPath, router]);
 
   const handleCwdChange = useCallback((cwd: string | null, projectRoot?: string | null) => {
     invalidateWorkspaceRestore();
@@ -511,8 +528,8 @@ export function AppShell() {
       // the default welcome page when none is remembered.
       restoreWorkspaceContext(newProject);
     }
-    router.replace("/", { scroll: false });
-  }, [activeCwd, invalidateWorkspaceRestore, newSessionCwd, router, selectedSession, restoreWorkspaceContext]);
+    router.replace(currentChatPath(), { scroll: false });
+  }, [activeCwd, currentChatPath, invalidateWorkspaceRestore, newSessionCwd, router, selectedSession, restoreWorkspaceContext]);
 
   const handleSelectSession = useCallback((session: SessionInfo, isRestore = false) => {
     invalidateWorkspaceRestore();
@@ -545,9 +562,9 @@ export function AppShell() {
     // Skip router.replace when restoring from URL — the param is already correct
     // and calling replace in production Next.js triggers a Suspense remount loop
     if (!isRestore) {
-      router.replace(`?session=${encodeURIComponent(session.id)}`, { scroll: false });
+      router.replace(currentChatPath(session.id), { scroll: false });
     }
-  }, [invalidateWorkspaceRestore, router, isMobile, selectedSession]);
+  }, [currentChatPath, invalidateWorkspaceRestore, router, isMobile, selectedSession]);
 
   const handleNewSession = useCallback((sessionId: string, cwd: string) => {
     invalidateWorkspaceRestore();
@@ -562,8 +579,8 @@ export function AppShell() {
     setSystemPrompt(null);
     setActiveTopPanel(null);
     if (isMobile) setSidebarOpen(false);
-    router.replace("/", { scroll: false });
-  }, [invalidateWorkspaceRestore, router, isMobile]);
+    router.replace(currentChatPath(), { scroll: false });
+  }, [currentChatPath, invalidateWorkspaceRestore, router, isMobile]);
 
   // Global keyboard shortcuts (handles Esc, Ctrl+Alt+N etc.)
   useGlobalKeyboardShortcuts({
@@ -599,8 +616,8 @@ export function AppShell() {
     setNewSessionCwd(null);
     setSelectedSession(session);
     hydrateSelectedSession(session.id);
-    router.replace(`?session=${encodeURIComponent(session.id)}`, { scroll: false });
-  }, [invalidateWorkspaceRestore, router, hydrateSelectedSession]);
+    router.replace(currentChatPath(session.id), { scroll: false });
+  }, [currentChatPath, invalidateWorkspaceRestore, router, hydrateSelectedSession]);
 
   const deliverSessionNotification = useCallback(({
     targetSession,
@@ -616,7 +633,7 @@ export function AppShell() {
     if (!("Notification" in window)) return;
 
     const fire = () => {
-      const sessionUrl = targetSession ? `/?session=${encodeURIComponent(targetSession.id)}` : "/";
+      const sessionUrl = piChatPath(targetSession?.id);
       void showBrowserNotification({
         title,
         body,
@@ -716,8 +733,8 @@ export function AppShell() {
       transient: false,
     }));
     hydrateSelectedSession(newSessionId);
-    router.replace(`?session=${encodeURIComponent(newSessionId)}`, { scroll: false });
-  }, [invalidateWorkspaceRestore, router, hydrateSelectedSession]);
+    router.replace(currentChatPath(newSessionId), { scroll: false });
+  }, [currentChatPath, invalidateWorkspaceRestore, router, hydrateSelectedSession]);
 
   const handleInitialRestoreDone = useCallback(() => {
     setInitialSessionRestored(true);
@@ -740,9 +757,9 @@ export function AppShell() {
       setBranchActiveLeafId(null);
       setSystemPrompt(null);
       setActiveTopPanel(null);
-      router.replace("/", { scroll: false });
+      router.replace(currentChatPath(), { scroll: false });
     }
-  }, [invalidateWorkspaceRestore, selectedSession, router]);
+  }, [currentChatPath, invalidateWorkspaceRestore, selectedSession, router]);
 
   const handleOpenFile = useCallback((
     filePath: string,
@@ -884,6 +901,7 @@ export function AppShell() {
         onAtMentions={handleAtMentions}
         onBackgroundTaskDone={handleBackgroundTaskDone}
         onRunningSessionIdsChange={handleRunningSessionIdsChange}
+        scopeCwd={sessionScopeCwd}
       />
       <div style={{ padding: "8px", flexShrink: 0, display: "flex", justifyContent: "space-between", gap: 4 }}>
         {([
@@ -1651,7 +1669,8 @@ export function AppShell() {
           "--sidebar-width": `${sidebarResizer.width}px`,
           background: "var(--bg-panel)",
           borderRight: "1px solid var(--border)",
-          display: embedded ? "none" : "flex",
+          display: embedded && !embeddedSessionSidebar ? "none" : "flex",
+          width: embeddedSessionSidebar ? "230px" : undefined,
           flexDirection: "column",
           flexShrink: 0,
           paddingTop: "env(safe-area-inset-top)",

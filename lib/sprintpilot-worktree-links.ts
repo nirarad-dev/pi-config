@@ -39,6 +39,10 @@ export function persistedWorktreeLinks(repoRoot: string): Map<string, string> {
   ));
 }
 
+export function persistedWorktreeRepositories(): string[] {
+  return Object.keys(readState().repositories).map((repository) => resolve(repository));
+}
+
 export function persistWorktreeLink(repoRoot: string, key: string, worktree: string) {
   const state = readState();
   const repository = resolve(repoRoot);

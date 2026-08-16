@@ -42,12 +42,11 @@ export function mergeSessionLists(
   return [...byId.values()].sort((a, b) => b.modified.localeCompare(a.modified));
 }
 
-async function loadAllSessions(): Promise<SessionInfo[]> {
-  const piSessions: PiSessionInfo[] = await SessionManager.listAll();
+function mapPiSessions(piSessions: PiSessionInfo[]): SessionInfo[] {
   const pathToId = new Map<string, string>();
   for (const s of piSessions) pathToId.set(sessionPathKey(s.path), s.id);
 
-  const sessions = piSessions.map((s) => {
+  return piSessions.map((s) => {
     cacheSessionPath(s.id, s.path);
     return {
       path: s.path,
@@ -62,7 +61,17 @@ async function loadAllSessions(): Promise<SessionInfo[]> {
       transient: false,
     };
   });
-  return attachSessionProjectInfo(sessions);
+}
+
+async function loadAllSessions(): Promise<SessionInfo[]> {
+  const piSessions: PiSessionInfo[] = await SessionManager.listAll();
+  return attachSessionProjectInfo(mapPiSessions(piSessions));
+}
+
+/** Use Pi's native cwd index when a caller needs one exact checkout. */
+export async function listSessionsForCwd(cwd: string): Promise<SessionInfo[]> {
+  const piSessions: PiSessionInfo[] = await SessionManager.list(cwd);
+  return attachSessionProjectInfo(mapPiSessions(piSessions));
 }
 
 export async function listAllSessions(options: { force?: boolean } = {}): Promise<SessionInfo[]> {

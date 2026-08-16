@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "crypto";
 import { execFile } from "child_process";
 import { existsSync, readFileSync, realpathSync } from "fs";
-import { resolve } from "path";
+import { dirname, isAbsolute, resolve } from "path";
 import { promisify } from "util";
 
 const execFileAsync = promisify(execFile);
@@ -21,8 +21,37 @@ export function configuredRepoRoot(): string {
   return resolve(process.env.SPRINTPILOT_REPO_ROOT || "/Users/nirarad/git/arnac");
 }
 
-export async function registeredSprintWorktrees(): Promise<Map<string, string | undefined>> {
-  const repo = realpathSync(configuredRepoRoot());
+export function sprintPilotTicketTail(key: string, summary: string): string {
+  const slug = summary.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").slice(0, 42).replace(/-$/g, "") || "task";
+  return `${key}-${slug}`;
+}
+
+export function sprintPilotBranchName(key: string, summary: string): string {
+  return `nir/${sprintPilotTicketTail(key, summary)}`;
+}
+
+export function matchingSprintPilotBranch(branches: string[], requestedBranch: string): string | undefined {
+  const normalized = requestedBranch.toLowerCase();
+  return branches.find((branch) => branch.toLowerCase() === normalized);
+}
+
+export function sprintPilotWorktreeAddArgs(branch: string, worktree: string, reuseBranch: boolean): string[] {
+  return reuseBranch
+    ? ["worktree", "add", worktree, branch]
+    : ["worktree", "add", "--no-track", "-b", branch, worktree, "origin/main"];
+}
+
+export async function resolveSprintRepository(candidate: unknown = configuredRepoRoot()): Promise<string> {
+  if (typeof candidate !== "string" || !isAbsolute(candidate)) throw new Error("An absolute repository path is required");
+  if (!existsSync(candidate)) throw new Error(`Repository does not exist: ${candidate}`);
+  const repo = realpathSync(candidate);
+  const top = realpathSync((await run("git", ["rev-parse", "--show-toplevel"], repo)).trim());
+  if (top !== repo) throw new Error("Select the root of a Git repository");
+  return repo;
+}
+
+export async function registeredSprintWorktrees(repoRoot: unknown = configuredRepoRoot()): Promise<Map<string, string | undefined>> {
+  const repo = await resolveSprintRepository(repoRoot);
   const output = await run("git", ["worktree", "list", "--porcelain"], repo);
   const worktrees = new Map<string, string | undefined>();
   for (const block of output.split(/\n\n+/)) {
@@ -35,20 +64,28 @@ export async function registeredSprintWorktrees(): Promise<Map<string, string | 
   return worktrees;
 }
 
-export async function assertSprintWorktree(cwd: unknown): Promise<string> {
+export async function sprintRepositoryForWorktree(cwd: unknown): Promise<string> {
   if (typeof cwd !== "string" || !cwd.startsWith("/")) throw new Error("An absolute worktree path is required");
   if (!existsSync(cwd)) throw new Error(`Worktree does not exist: ${cwd}`);
   const realCwd = realpathSync(cwd);
-  const repo = realpathSync(configuredRepoRoot());
   const top = realpathSync((await run("git", ["rev-parse", "--show-toplevel"], realCwd)).trim());
   if (top !== realCwd) throw new Error("The path must be the worktree root");
-  const registered = await registeredSprintWorktrees();
-  if (!registered.has(realCwd)) throw new Error("Path is not a registered worktree of the configured repository");
+  const commonDirectory = (await run("git", ["rev-parse", "--git-common-dir"], realCwd)).trim();
+  const commonPath = realpathSync(isAbsolute(commonDirectory) ? commonDirectory : resolve(realCwd, commonDirectory));
+  const repo = await resolveSprintRepository(dirname(commonPath));
+  const registered = await registeredSprintWorktrees(repo);
+  if (!registered.has(realCwd)) throw new Error("Path is not a registered worktree of its repository");
   const [repoRemote, worktreeRemote] = await Promise.all([
     run("git", ["remote", "get-url", "origin"], repo),
     run("git", ["remote", "get-url", "origin"], realCwd),
   ]);
-  if (repoRemote.trim() !== worktreeRemote.trim()) throw new Error("Worktree origin does not match the configured repository");
+  if (repoRemote.trim() !== worktreeRemote.trim()) throw new Error("Worktree origin does not match its repository");
+  return repo;
+}
+
+export async function assertSprintWorktree(cwd: unknown): Promise<string> {
+  await sprintRepositoryForWorktree(cwd);
+  const realCwd = realpathSync(String(cwd));
   return realCwd;
 }
 

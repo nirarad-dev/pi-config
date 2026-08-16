@@ -57,7 +57,8 @@ test("offers the downstream context-menu hook only on a normal session row", () 
 });
 
 test("manual and lifecycle refreshes bypass the server session-list cache", () => {
-  assert.match(source, /force \? "\/api\/sessions\?force=1" : "\/api\/sessions"/);
+  assert.match(source, /if \(force\) params\.set\("force", "1"\)/);
+  assert.match(source, /fetch\(`\/api\/sessions\$\{query \? `\?\$\{query\}` : ""\}`/);
   assert.match(source, /cache: "no-store"/);
   assert.match(source, /loadSessions\(isFirst, !isFirst\)/);
   assert.match(source, /onClick=\{\(\) => loadSessions\(false, true\)\}/);

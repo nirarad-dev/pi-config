@@ -167,6 +167,7 @@ export class AgentSessionWrapper {
   private extensionWidgetGenerations = new Map<string, number>();
   private extensionWidgetsResetting = false;
   private pendingPromptCount = 0;
+  private lastPromptFinishedAt: number | undefined;
   private promptAdmissionTail: Promise<void> = Promise.resolve();
   private extensionsBound = false;
   private extensionBindingPromise: Promise<void> | null = null;
@@ -206,6 +207,14 @@ export class AgentSessionWrapper {
 
   isRunning(): boolean {
     return this._alive && (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning);
+  }
+
+  getMonitorState(): { running: boolean; needsUserInput: boolean; lastPromptFinishedAt?: number } {
+    return {
+      running: this.isRunning(),
+      needsUserInput: this.pendingUiRequests.size > 0,
+      lastPromptFinishedAt: this.lastPromptFinishedAt,
+    };
   }
 
   start(): void {
@@ -429,9 +438,10 @@ export class AgentSessionWrapper {
               reject(error);
             };
           });
-          const finishPrompt = () => {
+          const finishPrompt = (completed = false) => {
             if (promptSettled) return;
             promptSettled = true;
+            if (completed) this.lastPromptFinishedAt = Date.now();
             this.pendingPromptCount = Math.max(0, this.pendingPromptCount - 1);
             this.resetIdleTimer();
             notifyRunningChange();
@@ -460,11 +470,11 @@ export class AgentSessionWrapper {
             // Compatibility fallback if a future SDK resolves without invoking
             // the internal callback. This waits for the run, but never acks early.
             acceptPreflight();
-            finishPrompt();
+            finishPrompt(preflightAccepted);
             if (!streamingBehavior) this.emit({ type: "prompt_done" });
           }, (error) => {
             rejectPreflight(error);
-            finishPrompt();
+            finishPrompt(preflightAccepted);
             invalidateSessionListCache();
             // A preflight rejection is returned by the POST itself. Only an
             // unexpected failure after acceptance needs the asynchronous event.
@@ -519,6 +529,8 @@ export class AgentSessionWrapper {
           thinkingLevel: this.inner.agent.state?.thinkingLevel ?? "off",
           extensionStatuses: this.getExtensionStatuses(),
           extensionWidgets: this.getExtensionWidgets(),
+          needsUserInput: this.pendingUiRequests.size > 0,
+          lastPromptFinishedAt: this.lastPromptFinishedAt,
         };
       }
 

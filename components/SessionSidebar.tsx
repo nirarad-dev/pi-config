@@ -96,6 +96,8 @@ interface Props {
    *  Lets the app play a cross-workspace completion tone. */
   onBackgroundTaskDone?: () => void;
   onRunningSessionIdsChange?: (ids: Set<string>) => void;
+  /** Lock the sidebar to sessions whose cwd is this exact checkout. */
+  scopeCwd?: string | null;
 }
 
 interface WorktreeEntry {
@@ -392,7 +394,7 @@ function PiWebTitle() {
   );
 }
 
-export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onOpenFile, explorerRefreshKey, onExplorerRefresh, onAtMention, onAtMentions, onBackgroundTaskDone, onRunningSessionIdsChange }: Props) {
+export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onOpenFile, explorerRefreshKey, onExplorerRefresh, onAtMention, onAtMentions, onBackgroundTaskDone, onRunningSessionIdsChange, scopeCwd }: Props) {
   const { t } = useI18n();
   const [allSessions, setAllSessions] = useState<SessionInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -438,7 +440,11 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const loadSessions = useCallback(async (showLoading = false, force = false) => {
     try {
       if (showLoading) setLoading(true);
-      const res = await fetch(force ? "/api/sessions?force=1" : "/api/sessions", {
+      const params = new URLSearchParams();
+      if (force) params.set("force", "1");
+      if (scopeCwd) params.set("cwd", scopeCwd);
+      const query = params.toString();
+      const res = await fetch(`/api/sessions${query ? `?${query}` : ""}`, {
         cache: "no-store",
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -467,7 +473,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     } finally {
       if (showLoading) setLoading(false);
     }
-  }, []);
+  }, [scopeCwd]);
 
   const initialLoadDone = useRef(false);
   useEffect(() => {
@@ -631,6 +637,11 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     }
   }, [selectedCwdProp]);
 
+  useEffect(() => {
+    if (!scopeCwd) return;
+    setSelectedCwd(scopeCwd);
+  }, [scopeCwd]);
+
   // Load worktrees for the current effective cwd
   const [wtRefreshKey, setWtRefreshKey] = useState(0);
   useLayoutEffect(() => {
@@ -672,23 +683,41 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   useEffect(() => {
     if (allSessions.length === 0 || skipInitialProjectSelection) return;
 
+    // Restore the requested session even when a fixed worktree already set cwd.
+    if (initialSessionId && !restoredRef.current) {
+      restoredRef.current = true;
+      const target = allSessions.find((s) => s.id === initialSessionId);
+      if (target) {
+        setSelectedCwd(target.cwd);
+        onSelectSession(target, true);
+        return;
+      }
+      // A stale/mismatched id must never escape a fixed worktree scope. Open
+      // the most recent session that actually belongs to this checkout.
+      if (scopeCwd && allSessions[0]) {
+        setSelectedCwd(allSessions[0].cwd);
+        onSelectSession(allSessions[0], true);
+        return;
+      }
+      onInitialRestoreDone?.();
+    }
+
     if (selectedCwd === null) {
-      // If restoring a session, set cwd to match that session
-      if (initialSessionId && !restoredRef.current) {
-        restoredRef.current = true;
-        const target = allSessions.find((s) => s.id === initialSessionId);
-        if (target) {
-          setSelectedCwd(target.cwd);
-          onSelectSession(target, true);
-          return;
-        }
-        // Session not found — notify parent so it can show the placeholder
-        onInitialRestoreDone?.();
+      if (scopeCwd) {
+        setSelectedCwd(scopeCwd);
+        if (!initialSessionId && allSessions[0]) onSelectSession(allSessions[0], true);
+        return;
       }
       const projects = getRecentProjects(allSessions);
       if (projects.length > 0) setSelectedCwd(projects[0]);
     }
-  }, [allSessions, selectedCwd, initialSessionId, skipInitialProjectSelection, onSelectSession, onInitialRestoreDone]);
+  }, [allSessions, selectedCwd, initialSessionId, skipInitialProjectSelection, onSelectSession, onInitialRestoreDone, scopeCwd]);
+
+  useEffect(() => {
+    if (!scopeCwd || loading || allSessions.length > 0 || !initialSessionId || restoredRef.current) return;
+    restoredRef.current = true;
+    onInitialRestoreDone?.();
+  }, [allSessions.length, initialSessionId, loading, onInitialRestoreDone, scopeCwd]);
 
   // Prefer an exact UI selection while a refetch is in flight. Once the
   // response catches up, the server-resolved path handles Windows case and
@@ -892,11 +921,14 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     [projectActivity, selectedProject],
   );
 
-  const filteredSessions = selectedProject
+  const filteredSessions = scopeCwd
+    ? allSessions
+    : selectedProject
     ? allSessions.filter((s) => (s.projectRoot ?? s.cwd) === selectedProject)
     : allSessions;
   const showWorktreeSwitcher = Boolean(
-    worktreeState?.isGit
+    !scopeCwd
+    && worktreeState?.isGit
     && worktreeState.isTopLevel
     && selectedCwd
     && selectedProject === worktreeState.projectRoot
@@ -1031,8 +1063,14 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
           </div>
         </div>
 
-        {/* CWD picker */}
-        <div ref={dropdownRef} style={{ position: "relative" }}>
+        {/* CWD picker, or an immutable scope label inside SprintPilot. */}
+        {scopeCwd ? <div
+          title={scopeCwd}
+          style={{ display: "flex", alignItems: "center", gap: 7, padding: "6px 10px", background: "var(--bg-hover)", border: "1px solid var(--border)", borderRadius: 7 }}
+        >
+          <span aria-hidden="true" style={{ color: "var(--accent)", fontSize: 10 }}>●</span>
+          <PathLabel text={displayCwd(scopeCwd, homeDir)} style={{ flex: 1, fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text)" }}/>
+        </div> : <div ref={dropdownRef} style={{ position: "relative" }}>
           <button
             onClick={() => setDropdownOpen((v) => !v)}
             title={selectedProject ?? selectedCwd ?? ""}
@@ -1235,7 +1273,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
                 <span>{t("sidebar.customPath")}</span>
               </button>
           </AnimatedDropdown>
-        </div>
+        </div>}
 
         {/* Worktree switcher — shown only for git projects at a checkout top
             level (repo subdirs keep their own project identity, so switching

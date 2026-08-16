@@ -18,9 +18,14 @@ const { GET: getSessionState } = await jiti.import("./[id]/state/route.ts");
 test("session listing merges live registry snapshots and honors force refresh", () => {
   assert.match(listRoute, /searchParams\.get\("force"\) === "1"/);
   assert.match(listRoute, /listAllSessions\(\{ force \}\)/);
-  assert.match(listRoute, /attachSessionProjectInfo\(getRpcSessionInfos\(\)\)/);
+  assert.match(listRoute, /attachSessionProjectInfo\(cwd \? runtimeInfos\.filter/);
   assert.match(listRoute, /mergeSessionLists\(persistedSessions, runtimeSessions\)/);
   assert.match(listRoute, /"Cache-Control": "no-store"/);
+});
+
+test("session listing delegates exact-worktree scope to Pi's cwd index", () => {
+  assert.match(listRoute, /cwd \? listSessionsForCwd\(cwd\) : listAllSessions/);
+  assert.match(listRoute, /samePath\(session\.cwd, cwd\)/);
 });
 
 test("session reads use the live SessionManager before requiring a JSONL path", () => {

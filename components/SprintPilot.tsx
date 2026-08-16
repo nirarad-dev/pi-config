@@ -11,6 +11,7 @@ import { sprintPilotDiffTokenStyles } from "@/lib/sprintpilot-highlight";
 import { buildReviewFixPrompt, type ReviewComment } from "@/lib/sprintpilot-review";
 import { sprintPilotDiffLanguage } from "@/lib/sprintpilot-syntax";
 import type { ProviderRateLimits, SprintPilotUsage } from "@/lib/sprintpilot-usage";
+import { DirectoryPicker } from "./DirectoryPicker";
 import { FolderIcon, getFileIcon } from "./FileIcons";
 import styles from "./SprintPilot.module.css";
 
@@ -25,6 +26,8 @@ type ModelResponse = {
 
 type GitFile = { filePath: string; status: string };
 type WorktreeCandidate = { key: string; worktree: string; branch?: string };
+type WorktreeSource = { id: string; label: string; path: string; available: boolean };
+type CreateWorktreeSetup = { loading: boolean; sources: WorktreeSource[]; error?: string };
 type LinkSetup = {
   key: string;
   loading: boolean;
@@ -44,6 +47,12 @@ type AuthSetup = {
   options?: { id: string; label: string }[];
 };
 type CommitSetup = { phase: "loading" | "ready" | "error"; message: string; error?: string };
+type AgentAlert = "finished" | "attention";
+type AgentStatusSnapshot = {
+  running: boolean;
+  needsUserInput: boolean;
+  lastPromptFinishedAt?: number;
+};
 type TaskRuntime = {
   worktree?: string;
   branch?: string;
@@ -337,12 +346,18 @@ export function SprintPilot() {
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{ key: string; worktree: string } | null>(null);
+  const [createWorktreeSetup, setCreateWorktreeSetup] = useState<CreateWorktreeSetup | null>(null);
+  const [browseRepoOpen, setBrowseRepoOpen] = useState(false);
+  const [browseRepoInitialPath, setBrowseRepoInitialPath] = useState<string>();
+  const [browseRepoError, setBrowseRepoError] = useState<string>();
   const [linkSetup, setLinkSetup] = useState<LinkSetup | null>(null);
   const [restartStep, setRestartStep] = useState<WorkflowStep | null>(null);
   const [authSetup, setAuthSetup] = useState<AuthSetup | null>(null);
   const [commitSetup, setCommitSetup] = useState<CommitSetup | null>(null);
+  const [agentAlerts, setAgentAlerts] = useState<Record<string, AgentAlert>>({});
   const authEvents = useRef<EventSource | null>(null);
   const jiraSyncing = useRef(false);
+  const agentStatusRef = useRef(new Map<string, { running: boolean; lastFinishedAt?: number }>());
 
   const task = tasks.find((candidate) => candidate.key === activeKey) || tasks[0];
   const storedState = runtime[activeKey] || initialRuntime();
@@ -364,6 +379,15 @@ export function SprintPilot() {
       return { ...current, [activeKey]: next };
     });
   }, [activeKey]);
+
+  const clearFinishedAlert = useCallback((key: string) => {
+    setAgentAlerts((current) => {
+      if (current[key] !== "finished") return current;
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  }, []);
 
   const syncJiraTasks = useCallback(async ({ announce = false, worktrees = [] }: {
     announce?: boolean;
@@ -450,6 +474,65 @@ export function SprintPilot() {
     const timer = window.setInterval(refreshUsage, 60_000);
     return () => window.clearInterval(timer);
   }, []);
+
+  const taskAgentSessions = useMemo(() => Object.entries(runtime).flatMap(([key, taskRuntime]) =>
+    taskRuntime.sessionId ? [{ key, sessionId: taskRuntime.sessionId }] : []
+  ), [runtime]);
+
+  useEffect(() => {
+    if (!taskAgentSessions.length) return;
+    let cancelled = false;
+    let polling = false;
+    const pollAgentStates = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        const sessionIds = [...new Set(taskAgentSessions.map(({ sessionId }) => sessionId))];
+        const result = await jsonRequest<{ statuses: Record<string, AgentStatusSnapshot> }>(`/api/sprintpilot/agent-status?ids=${encodeURIComponent(sessionIds.join(","))}`);
+        const snapshots = taskAgentSessions.map(({ key, sessionId }) => ({ key, sessionId, snapshot: result.statuses[sessionId] }));
+        if (cancelled) return;
+        setAgentAlerts((current) => {
+          const next = { ...current };
+          let changed = false;
+          for (const result of snapshots) {
+            if (!result?.snapshot) continue;
+            const { key, sessionId, snapshot } = result;
+            const running = snapshot.running;
+            const needsInput = snapshot.needsUserInput;
+            const lastFinishedAt = snapshot.lastPromptFinishedAt;
+            const previous = agentStatusRef.current.get(sessionId);
+            const newlyFinished = !running && Boolean(lastFinishedAt) && previous?.lastFinishedAt !== lastFinishedAt;
+
+            if (needsInput) {
+              if (next[key] !== "attention") { next[key] = "attention"; changed = true; }
+            } else if (running) {
+              if (next[key]) { delete next[key]; changed = true; }
+            } else if (newlyFinished || previous?.running) {
+              if (next[key] !== "finished") { next[key] = "finished"; changed = true; }
+            } else if (next[key] === "attention") {
+              delete next[key];
+              changed = true;
+            }
+            agentStatusRef.current.set(sessionId, { running, lastFinishedAt: lastFinishedAt ?? previous?.lastFinishedAt });
+          }
+          return changed ? next : current;
+        });
+      } catch {
+        // Preserve the last known signal through a transient monitoring failure.
+      } finally {
+        polling = false;
+      }
+    };
+    void pollAgentStates();
+    const timer = window.setInterval(pollAgentStates, 2_000);
+    const handleVisibility = () => { if (document.visibilityState === "visible") void pollAgentStates(); };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, [taskAgentSessions]);
 
   const connectProvider = (provider: "anthropic" | "openai-codex") => {
     authEvents.current?.close();
@@ -559,6 +642,7 @@ export function SprintPilot() {
         completed: normalizeCompletedSteps(selectedTask ? completedStepsForJiraStatus(selectedTask.status) : [], storedCompletedSteps(key)),
       } };
     });
+    clearFinishedAlert(key);
     setActiveKey(key);
   };
 
@@ -581,6 +665,7 @@ export function SprintPilot() {
 
   const runPiAction = async (step: WorkflowStep) => {
     if (!task || !state.worktree || !state.provider || !state.modelId || !actionPrompts[step]) return;
+    clearFinishedAlert(task.key);
     setBusy(step);
     try {
       const result = await jsonRequest<{ sessionId: string }>("/api/agent/new", {
@@ -599,6 +684,7 @@ export function SprintPilot() {
 
   const startDevelopmentSession = async () => {
     if (!task || !state.worktree || !state.provider || !state.modelId) return;
+    clearFinishedAlert(task.key);
     setBusy("development-session");
     try {
       const result = await jsonRequest<{ sessionId: string }>("/api/agent/new", {
@@ -616,16 +702,36 @@ export function SprintPilot() {
     }
   };
 
-  const createWorktree = async () => {
+  const openCreateWorktree = async () => {
+    setCreateWorktreeSetup({ loading: true, sources: [] });
+    try {
+      const result = await jsonRequest<{ sources: WorktreeSource[] }>("/api/sprintpilot/worktree?sources=1");
+      setCreateWorktreeSetup({ loading: false, sources: result.sources });
+    } catch (error) {
+      setCreateWorktreeSetup({ loading: false, sources: [], error: error instanceof Error ? error.message : String(error) });
+    }
+  };
+
+  const createWorktree = async ({ source, repoRoot }: { source?: string; repoRoot?: string }) => {
     if (!task) return;
     setBusy("worktree");
+    setBrowseRepoError(undefined);
     try {
-      const result = await jsonRequest<{ worktree: string; branch: string }>("/api/sprintpilot/worktree", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(task),
+      const result = await jsonRequest<{ worktree: string; branch: string; source: string; reusedBranch?: boolean }>("/api/sprintpilot/worktree", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...task, source, repoRoot }),
       });
       updateRuntime(result);
-      setNotice(`Fresh worktree created from origin/main: ${result.branch}`);
-    } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
+      setCreateWorktreeSetup(null);
+      setBrowseRepoOpen(false);
+      setNotice(result.reusedBranch
+        ? `${result.source} worktree recreated on retained branch: ${result.branch}`
+        : `Fresh ${result.source} worktree created from origin/main: ${result.branch}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (repoRoot) setBrowseRepoError(message);
+      else setCreateWorktreeSetup((current) => current ? { ...current, error: message } : current);
+      setNotice(message);
+    }
     finally { setBusy(null); }
   };
 
@@ -836,12 +942,15 @@ export function SprintPilot() {
         <div className={styles.sectionLabel}>CURRENT SPRINT <span>{tasks.length}</span></div>
         <div className={styles.jiraSyncBar}><button disabled={jiraRefreshing} onClick={() => syncJiraTasks({ announce: true })}><span aria-hidden="true">↻</span>{jiraRefreshing ? "SYNCING JIRA…" : "REFRESH JIRA"}</button><small title={lastJiraSync ? `Last synced ${lastJiraSync.toLocaleString()}` : "Waiting for first sync"}>AUTO · 1 MIN{lastJiraSync ? ` · ${lastJiraSync.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}</small></div>
         {!jiraConfigured && <p className={styles.jiraWarning}><b>DEMO DATA</b> Jira is not connected. Copy <code>sprintpilot.env.example</code> to <code>.env.local</code>, add your Jira email and API token, then restart the app.</p>}
-        <div className={styles.taskList}>{tasks.map((item) => <button key={item.key} className={`${styles.taskCard} ${item.key === activeKey ? styles.activeTask : ""}`} onClick={() => openTask(item.key)}>
+        <div className={styles.taskList}>{tasks.map((item) => {
+          const agentAlert = agentAlerts[item.key];
+          return <button key={item.key} className={`${styles.taskCard} ${item.key === activeKey ? styles.activeTask : ""} ${agentAlert === "attention" ? styles.taskCardAgentAttention : agentAlert === "finished" ? styles.taskCardAgentFinished : ""}`} onClick={() => openTask(item.key)}>
           <span className={styles.taskMeta}><span className={styles.keyIdentity}><IssueTypeIcon type={item.issueType}/><b>{item.key}</b><small>{item.issueType || "Task"}</small></span><i>{item.priority}</i></span>
           {item.epicName && <span className={styles.taskEpic}><IssueTypeIcon epic/><b>EPIC</b><strong>{item.epicKey}</strong><span>{item.epicName}</span></span>}
           <span className={styles.taskTitle}>{item.summary}</span>
           <span className={styles.taskStatus}>{item.status}</span>
-        </button>)}</div>
+          {agentAlert && <span className={`${styles.taskAgentSignal} ${agentAlert === "attention" ? styles.taskAgentNeedsInput : styles.taskAgentFinished}`}><i/>{agentAlert === "attention" ? "INPUT NEEDED" : "AGENT FINISHED"}</span>}
+        </button>})}</div>
       </aside>
 
       <section className={styles.workspace}>
@@ -850,7 +959,7 @@ export function SprintPilot() {
           <div className={styles.taskHeader}>
             <div><span className={styles.eyebrow}><span><IssueTypeIcon type={task.issueType}/>{task.issueType || "Task"} {task.key}</span><span>{task.status}</span>{task.epicName && <span><IssueTypeIcon epic/>EPIC {task.epicKey} · {task.epicName}</span>}</span><h1>{task.summary}</h1><p>{state.worktree || "No worktree yet — create one from the latest origin/main before starting."}</p></div>
             {!state.worktree
-              ? <div className={styles.worktreeActions}><button className={styles.primary} disabled={!!busy} onClick={createWorktree}>{busy === "worktree" ? "CREATING…" : "CREATE WORKTREE"}</button><button className={styles.secondary} disabled={!!busy} onClick={findExistingWorktrees}>LINK EXISTING WT</button></div>
+              ? <div className={styles.worktreeActions}><button className={styles.primary} disabled={!!busy} onClick={openCreateWorktree}>{busy === "worktree" ? "CREATING…" : "CREATE WORKTREE"}</button><button className={styles.secondary} disabled={!!busy} onClick={findExistingWorktrees}>LINK EXISTING WT</button></div>
               : <button className={styles.danger} disabled={!!busy} onClick={() => setDeleteTarget({ key: task.key, worktree: state.worktree! })}>DELETE WT</button>}
           </div>
 
@@ -885,7 +994,7 @@ export function SprintPilot() {
               <div className={styles.panelHead}><span>DEVELOPMENT CONVERSATION</span><small>{state.sessionId ? `${providerLabel(state.provider || "")} · ${state.modelId}` : "TASK-SCOPED PI SESSION"}</small></div>
               {!state.worktree ? <div className={styles.developmentEmpty}><p>Link or create a worktree to start a development conversation for this Jira task.</p></div>
                 : !state.sessionId ? <div className={styles.developmentEmpty}><p>Talk to the selected model without leaving SprintPilot. The session runs in this task&apos;s worktree and follows the current model and effort settings.</p><button className={styles.primary} disabled={!!busy || !state.provider || !state.modelId} onClick={startDevelopmentSession}>{busy === "development-session" ? "STARTING…" : "START DEVELOPMENT CONVERSATION"}</button></div>
-                  : <><div className={styles.developmentToolbar}><span>● ACTIVE IN {state.worktree}</span><button onClick={() => setDevelopmentOpen((open) => !open)}>{developmentOpen ? "COLLAPSE" : "EXPAND"}</button><a href={`/chat?session=${encodeURIComponent(state.sessionId)}`}>OPEN FULL PI CHAT ↗</a></div>{developmentOpen && <iframe className={styles.developmentFrame} title={`${task.key} development conversation`} src={`/chat?session=${encodeURIComponent(state.sessionId)}&embedded=1&palette=sprintpilot`}/>}</>}
+                  : <><div className={styles.developmentToolbar}><span>● CHATS SCOPED TO {state.worktree}</span><button onClick={() => setDevelopmentOpen((open) => !open)}>{developmentOpen ? "COLLAPSE" : "EXPAND"}</button><a href={`/chat?session=${encodeURIComponent(state.sessionId)}`}>OPEN FULL PI CHAT ↗</a></div>{developmentOpen && <iframe className={styles.developmentFrame} title={`${task.key} worktree conversations`} src={`/chat?session=${encodeURIComponent(state.sessionId)}&embedded=1&palette=sprintpilot&scopeCwd=${encodeURIComponent(state.worktree)}`}/>}</>}
             </section>
 
             <section className={`${styles.panel} ${styles.changesPanel}`}>
@@ -989,6 +1098,31 @@ export function SprintPilot() {
         <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setDeleteTarget(null)}>CANCEL</button><button className={styles.danger} disabled={!!busy} onClick={deleteWorktree}>{busy === "delete-worktree" ? "DELETING…" : "YES, DELETE WORKTREE"}</button></div>
       </section>
     </div>}
+    {createWorktreeSetup && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setCreateWorktreeSetup(null); }}>
+      <section className={`${styles.modal} ${styles.createWorktreeModal}`} role="dialog" aria-modal="true" aria-labelledby="create-worktree-title">
+        <span className={styles.modalKicker}>SOURCE REPOSITORY</span>
+        <h2 id="create-worktree-title">Create a worktree for {task?.key}</h2>
+        <p>Choose the repository that owns this Jira task. The <strong>nir/</strong> branch and sibling worktree use the same Jira key and title slug, created from the latest <strong>origin/main</strong>.</p>
+        {createWorktreeSetup.loading && <p className={styles.scanProgress}>● CHECKING REPOSITORIES…</p>}
+        {createWorktreeSetup.error && <p className={styles.authError}>{createWorktreeSetup.error}</p>}
+        {!createWorktreeSetup.loading && <div className={styles.worktreeSourceGrid}>
+          {createWorktreeSetup.sources.map((source, index) => <button key={source.id} disabled={!source.available || !!busy} onClick={() => createWorktree({ source: source.id })}>
+            <span>{String(index + 1).padStart(2, "0")}</span><b>{source.label}</b><small>{source.available ? source.path : "Repository not found"}</small><em>{source.available ? "CLONE FROM MAIN →" : "UNAVAILABLE"}</em>
+          </button>)}
+          <button disabled={!!busy} onClick={() => { setBrowseRepoInitialPath(createWorktreeSetup.sources[0]?.path); setCreateWorktreeSetup(null); setBrowseRepoError(undefined); setBrowseRepoOpen(true); }}>
+            <span>04</span><b>OTHER</b><small>Browse to another local Git repository</small><em>BROWSE… →</em>
+          </button>
+        </div>}
+        <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setCreateWorktreeSetup(null)}>CANCEL</button></div>
+      </section>
+    </div>}
+    {browseRepoOpen && <DirectoryPicker
+      initialPath={browseRepoInitialPath}
+      busy={busy === "worktree"}
+      error={browseRepoError}
+      onCancel={() => { if (!busy) { setBrowseRepoOpen(false); setBrowseRepoError(undefined); } }}
+      onSelect={(repoRoot) => void createWorktree({ repoRoot })}
+    />}
     {linkSetup && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setLinkSetup(null); }}>
       <section className={`${styles.modal} ${styles.linkModal}`} role="dialog" aria-modal="true" aria-labelledby="link-worktree-title">
         <span className={styles.modalKicker}>EXISTING WORKTREE</span>
