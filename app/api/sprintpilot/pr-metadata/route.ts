@@ -16,11 +16,15 @@ export async function POST(request: Request) {
     const existing = getRpcSession(body.sessionId);
     const { session } = existing?.isAlive() ? { session: existing } : await startRpcSession(body.sessionId, sessionPath, undefined);
     await session.waitUntilReady?.();
-    const patch = await run("git", ["diff", "--no-ext-diff", "origin/main...HEAD"], cwd);
+    const [patch, commitLog] = await Promise.all([
+      run("git", ["diff", "--no-ext-diff", "origin/main...HEAD"], cwd),
+      run("git", ["log", "--reverse", "--no-merges", "--format=%s", "origin/main..HEAD"], cwd).catch(() => ""),
+    ]);
+    const commitSubjects = commitLog.split("\n").map((subject) => subject.trim()).filter(Boolean);
     const repo = basename(await sprintRepositoryForWorktree(cwd));
     const component = repo === "workflows" || /(?:^|\/)automation(?:\/|$)|\.github\/workflows\//.test(patch) ? "Automation" : repo.slice(0, 1).toUpperCase() + repo.slice(1);
     const metadata = await generateSprintPilotPullRequestMetadata(session.inner as unknown as AgentSession, {
-      component, taskKey: body.taskKey, summary: body.summary, taskDescription: body.taskDescription, patch,
+      component, taskKey: body.taskKey, summary: body.summary, taskDescription: body.taskDescription, patch, commitSubjects,
     });
     return NextResponse.json(metadata);
   } catch (error) {

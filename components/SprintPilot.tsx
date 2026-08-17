@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/cjs/styles/prism";
-import { completedStepsForJiraStatus, normalizeCompletedSteps, TEST_PRESETS, WORKFLOW_STEPS, type ModelEntry, type SprintTask, type WorkflowStep } from "@/lib/sprintpilot-config";
+import { completedStepsForJiraStatus, normalizeCompletedSteps, sortSprintTasks, SPRINT_TASK_GROUPS, sprintTaskGroup, TEST_PRESETS, WORKFLOW_STEPS, type ModelEntry, type SprintTask, type WorkflowStep } from "@/lib/sprintpilot-config";
 import { buildSprintPilotChangeTree, type SprintPilotChangeTreeNode } from "@/lib/sprintpilot-change-tree";
 import { parseDiff } from "@/lib/sprintpilot-diff";
 import type { SprintPilotHistoryLine } from "@/lib/sprintpilot-git-history";
@@ -47,8 +47,9 @@ type AuthSetup = {
   input?: string;
   options?: { id: string; label: string }[];
 };
-type CommitSetup = { phase: "loading" | "ready" | "error"; message: string; error?: string };
-type PullRequestSetup = { phase: "loading" | "ready" | "error"; draft: boolean; title: string; description: string; error?: string };
+type DraftOrigin = { generatedBy?: "agent" | "repaired" | "fallback"; model?: { provider: string; id: string; fast: boolean }; fallbackReason?: string };
+type CommitSetup = DraftOrigin & { phase: "loading" | "ready" | "error"; message: string; error?: string };
+type PullRequestSetup = DraftOrigin & { phase: "loading" | "ready" | "error"; draft: boolean; title: string; description: string; error?: string };
 type AgentAlert = "finished" | "attention";
 type AgentStatusSnapshot = {
   running: boolean;
@@ -57,6 +58,7 @@ type AgentStatusSnapshot = {
   lastPromptFinishedAt?: number;
 };
 type AgentRailStatus = "working" | "queued" | "needs-input" | "ready" | "idle";
+type PendingChanges = { changed: number; staged: number };
 type TaskRuntime = {
   worktree?: string;
   branch?: string;
@@ -114,6 +116,22 @@ function agentRailStatus(snapshot: AgentStatusSnapshot | undefined, alert: Agent
   if (snapshot?.running) return "working";
   if (alert === "finished") return "ready";
   return "idle";
+}
+
+/**
+ * Say where a draft came from. A fallback draft is only the changed-file list,
+ * so leaving it unlabelled made the deterministic builder look like the model's
+ * best effort — the reason drafting was reported as "very simple".
+ */
+function DraftProvenance({ origin }: { origin: DraftOrigin }) {
+  if (!origin.generatedBy) return null;
+  const model = origin.model ? `${origin.model.id}${origin.model.fast ? "" : " · full coding model"}` : "unknown model";
+  const detail = origin.generatedBy === "fallback"
+    ? `Offline template — no model was used.${origin.fallbackReason ? ` ${origin.fallbackReason}` : ""}`
+    : origin.generatedBy === "repaired"
+      ? `Drafted by ${model}, ticket prefix added automatically.`
+      : `Drafted by ${model}.`;
+  return <p className={`${styles.draftProvenance} ${origin.generatedBy === "fallback" ? styles.draftProvenanceFallback : ""}`}>{detail}</p>;
 }
 
 const AGENT_RAIL_STATUS: Record<AgentRailStatus, { label: string; title: string }> = {
@@ -375,6 +393,7 @@ export function SprintPilot() {
   const [linkSetup, setLinkSetup] = useState<LinkSetup | null>(null);
   const [restartStep, setRestartStep] = useState<WorkflowStep | null>(null);
   const [authSetup, setAuthSetup] = useState<AuthSetup | null>(null);
+  const [pendingChanges, setPendingChanges] = useState<Record<string, PendingChanges>>({});
   const [commitSetup, setCommitSetup] = useState<CommitSetup | null>(null);
   const [pullRequestSetup, setPullRequestSetup] = useState<PullRequestSetup | null>(null);
   const [agentAlerts, setAgentAlerts] = useState<Record<string, AgentAlert>>({});
@@ -513,6 +532,51 @@ export function SprintPilot() {
   const taskAgentSessions = useMemo(() => Object.entries(runtime).flatMap(([key, taskRuntime]) =>
     taskRuntime.sessionId ? [{ key, sessionId: taskRuntime.sessionId }] : []
   ), [runtime]);
+
+  const taskWorktrees = useMemo(() => Object.entries(runtime).flatMap(([key, taskRuntime]) =>
+    taskRuntime.worktree ? [{ key, worktree: taskRuntime.worktree }] : []
+  ), [runtime]);
+  // Serialized so the poll effect re-subscribes when the set of worktrees
+  // changes, not on every unrelated runtime update.
+  const worktreeKey = taskWorktrees.map(({ worktree }) => worktree).sort().join(",");
+
+  useEffect(() => {
+    if (!worktreeKey) {
+      setPendingChanges({});
+      return;
+    }
+    let cancelled = false;
+    let polling = false;
+    const pollPendingChanges = async () => {
+      if (polling || document.visibilityState === "hidden") return;
+      polling = true;
+      try {
+        const result = await jsonRequest<{ pending: Record<string, PendingChanges> }>(`/api/sprintpilot/pending-changes?worktrees=${encodeURIComponent(worktreeKey)}`);
+        if (cancelled) return;
+        setPendingChanges(Object.fromEntries(taskWorktrees.flatMap(({ key, worktree }) => {
+          const pending = result.pending[worktree];
+          return pending ? [[key, pending] as const] : [];
+        })));
+      } catch {
+        // A transient poll failure must not clear a badge the user is reading.
+      } finally {
+        polling = false;
+      }
+    };
+    pollPendingChanges();
+    const timer = window.setInterval(pollPendingChanges, 10_000);
+    document.addEventListener("visibilitychange", pollPendingChanges);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", pollPendingChanges);
+    };
+    // taskWorktrees is re-derived on every runtime change; worktreeKey is the
+    // value that actually decides what this effect polls.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [worktreeKey]);
+
+  const sortedTasks = useMemo(() => sortSprintTasks(tasks), [tasks]);
 
   useEffect(() => {
     if (!taskAgentSessions.length) return;
@@ -953,12 +1017,12 @@ export function SprintPilot() {
     setBusy("commit-message");
     try {
       const sessionId = await ensureTaskSession();
-      const result = await jsonRequest<{ message: string; approvalToken: string }>("/api/sprintpilot/git", {
+      const result = await jsonRequest<{ message: string; approvalToken: string } & DraftOrigin>("/api/sprintpilot/git", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "commit-message", cwd: state.worktree, files: state.selectedFiles, approvalToken: state.approvalToken, sessionId, taskKey: task.key, summary: task.summary, taskDescription: task.description, title: `${task.key}: ${task.summary}` }),
       });
       updateRuntime({ sessionId, approvalToken: result.approvalToken });
-      setCommitSetup({ phase: "ready", message: result.message });
+      setCommitSetup({ phase: "ready", message: result.message, generatedBy: result.generatedBy, model: result.model, fallbackReason: result.fallbackReason });
     } catch (error) {
       setCommitSetup({ phase: "error", message: "", error: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -972,12 +1036,12 @@ export function SprintPilot() {
     setBusy("pr-metadata");
     try {
       const sessionId = await ensureTaskSession();
-      const metadata = await jsonRequest<{ title: string; description: string }>("/api/sprintpilot/pr-metadata", {
+      const metadata = await jsonRequest<{ title: string; description: string } & DraftOrigin>("/api/sprintpilot/pr-metadata", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ cwd: state.worktree, sessionId, taskKey: task.key, summary: task.summary, taskDescription: task.description }),
       });
       updateRuntime({ sessionId });
-      setPullRequestSetup({ phase: "ready", draft, title: metadata.title, description: metadata.description });
+      setPullRequestSetup({ phase: "ready", draft, title: metadata.title, description: metadata.description, generatedBy: metadata.generatedBy, model: metadata.model });
     } catch (error) {
       setPullRequestSetup({ phase: "error", draft, title: "", description: "", error: error instanceof Error ? error.message : String(error) });
     } finally { setBusy(null); }
@@ -1024,16 +1088,31 @@ export function SprintPilot() {
         <div className={styles.sectionLabel}>CURRENT SPRINT <span>{tasks.length}</span></div>
         <div className={styles.jiraSyncBar}><button disabled={jiraRefreshing} onClick={() => syncJiraTasks({ announce: true })}><span aria-hidden="true">↻</span>{jiraRefreshing ? "SYNCING JIRA…" : "REFRESH JIRA"}</button><small title={lastJiraSync ? `Last synced ${lastJiraSync.toLocaleString()}` : "Waiting for first sync"}>AUTO · 1 MIN{lastJiraSync ? ` · ${lastJiraSync.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}</small></div>
         {!jiraConfigured && <p className={styles.jiraWarning}><b>DEMO DATA</b> Jira is not connected. Copy <code>sprintpilot.env.example</code> to <code>.env.local</code>, add your Jira email and API token, then restart the app.</p>}
-        <div className={styles.taskList}>{tasks.map((item) => {
-          const agentAlert = agentAlerts[item.key];
-          const status = agentRailStatus(agentStates[item.key], agentAlert);
-          return <button key={item.key} className={`${styles.taskCard} ${item.key === activeKey ? styles.activeTask : ""} ${agentAlert === "attention" ? styles.taskCardAgentAttention : agentAlert === "finished" ? styles.taskCardAgentFinished : ""}`} onClick={() => openTask(item.key)}>
-          <span className={styles.taskMeta}><span className={styles.keyIdentity}><IssueTypeIcon type={item.issueType}/><b>{item.key}</b><small>{item.issueType || "Task"}</small></span><i>{item.priority}</i></span>
-          {item.epicName && <span className={styles.taskEpic}><IssueTypeIcon epic/><b>EPIC</b><strong>{item.epicKey}</strong><span>{item.epicName}</span></span>}
-          <span className={styles.taskTitle}>{item.summary}</span>
-          <span className={styles.taskStatus}>{item.status}</span>
-          {status && <span className={`${styles.taskAgentSignal} ${styles[`taskAgent_${status}`]}`} title={AGENT_RAIL_STATUS[status].title}><i/>{AGENT_RAIL_STATUS[status].label}</span>}
-        </button>})}</div>
+        <div className={styles.taskList}>{SPRINT_TASK_GROUPS.flatMap((group) => {
+          const groupTasks = sortedTasks.filter((item) => sprintTaskGroup(item) === group.id);
+          if (!groupTasks.length) return [];
+          const groupPending = groupTasks.reduce((total, item) => total + (pendingChanges[item.key]?.changed || 0), 0);
+          return [
+            <div key={`group-${group.id}`} className={styles.taskGroupLabel}>
+              <span>{group.label}</span>
+              <b>{groupTasks.length}</b>
+              {groupPending > 0 && <em title={`${groupPending} uncommitted ${groupPending === 1 ? "file" : "files"} in this group`}>{groupPending} PENDING</em>}
+            </div>,
+            ...groupTasks.map((item) => {
+              const agentAlert = agentAlerts[item.key];
+              const status = agentRailStatus(agentStates[item.key], agentAlert);
+              const pending = pendingChanges[item.key];
+              return <button key={item.key} className={`${styles.taskCard} ${item.key === activeKey ? styles.activeTask : ""} ${pending?.changed ? styles.taskCardPending : ""} ${agentAlert === "attention" ? styles.taskCardAgentAttention : agentAlert === "finished" ? styles.taskCardAgentFinished : ""}`} onClick={() => openTask(item.key)}>
+                <span className={styles.taskMeta}><span className={styles.keyIdentity}><IssueTypeIcon type={item.issueType}/><b>{item.key}</b><small>{item.issueType || "Task"}</small></span><i>{item.priority}</i></span>
+                {item.epicName && <span className={styles.taskEpic}><IssueTypeIcon epic/><b>EPIC</b><strong>{item.epicKey}</strong><span>{item.epicName}</span></span>}
+                <span className={styles.taskTitle}>{item.summary}</span>
+                <span className={styles.taskStatus}>{item.status}</span>
+                {pending?.changed ? <span className={styles.taskPendingSignal} title={`${pending.changed} uncommitted ${pending.changed === 1 ? "file" : "files"}${pending.staged ? `, ${pending.staged} already staged` : ""} — review and commit`}><i/>{pending.changed} TO REVIEW{pending.staged ? ` · ${pending.staged} STAGED` : ""}</span> : null}
+                {status && <span className={`${styles.taskAgentSignal} ${styles[`taskAgent_${status}`]}`} title={AGENT_RAIL_STATUS[status].title}><i/>{AGENT_RAIL_STATUS[status].label}</span>}
+              </button>;
+            }),
+          ];
+        })}</div>
       </aside>
 
       <section className={styles.workspace}>
@@ -1161,8 +1240,8 @@ export function SprintPilot() {
         <p>The task agent used the exact approved snapshot and Jira details to explain the change. Edit it before committing if needed.</p>
         {commitSetup.phase === "loading" && <p className={styles.commitScan}>● DRAFTING FROM APPROVED CODE…</p>}
         {commitSetup.phase === "error" && <p className={styles.authError}>{commitSetup.error}</p>}
-        {commitSetup.phase === "ready" && <label>SUBJECT &amp; BODY<textarea autoFocus value={commitSetup.message} onChange={(event) => setCommitSetup({ ...commitSetup, message: event.target.value })}/></label>}
-        <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setCommitSetup(null)}>CANCEL</button><button className={styles.primary} disabled={commitSetup.phase !== "ready" || !commitSetup.message.trim() || !!busy} onClick={() => gitAction("commit", { message: commitSetup.message })}>{busy === "commit" ? "COMMITTING…" : "COMMIT APPROVED FILES"}</button></div>
+        {commitSetup.phase === "ready" && <><label>SUBJECT &amp; BODY<textarea autoFocus value={commitSetup.message} onChange={(event) => setCommitSetup({ ...commitSetup, message: event.target.value })}/></label><DraftProvenance origin={commitSetup}/></>}
+        <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setCommitSetup(null)}>CANCEL</button><button disabled={commitSetup.phase === "loading" || !!busy} onClick={() => prepareCommit()}>{busy === "commit-message" ? "DRAFTING…" : "REGENERATE"}</button><button className={styles.primary} disabled={commitSetup.phase !== "ready" || !commitSetup.message.trim() || !!busy} onClick={() => gitAction("commit", { message: commitSetup.message })}>{busy === "commit" ? "COMMITTING…" : "COMMIT APPROVED FILES"}</button></div>
       </section>
     </div>}
     {pullRequestSetup && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setPullRequestSetup(null); }}>
@@ -1172,8 +1251,8 @@ export function SprintPilot() {
         <p>The task agent read the current diff and drafted this metadata. The repository title format is enforced before the PR is created.</p>
         {pullRequestSetup.phase === "loading" && <p className={styles.commitScan}>● DRAFTING FROM CURRENT CHANGES…</p>}
         {pullRequestSetup.phase === "error" && <p className={styles.authError}>{pullRequestSetup.error}</p>}
-        {pullRequestSetup.phase === "ready" && <><label>PR TITLE<input autoFocus value={pullRequestSetup.title} onChange={(event) => setPullRequestSetup({ ...pullRequestSetup, title: event.target.value })}/></label><label>DESCRIPTION<textarea value={pullRequestSetup.description} onChange={(event) => setPullRequestSetup({ ...pullRequestSetup, description: event.target.value })}/></label></>}
-        <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setPullRequestSetup(null)}>CANCEL</button><button className={styles.primary} disabled={pullRequestSetup.phase !== "ready" || !pullRequestSetup.title.trim() || !pullRequestSetup.description.trim() || !!busy} onClick={async () => { if (await gitAction("pr", { draft: pullRequestSetup.draft, title: pullRequestSetup.title, description: pullRequestSetup.description })) setPullRequestSetup(null); }}>{busy === "pr" ? "OPENING…" : pullRequestSetup.draft ? "OPEN DRAFT PR" : "OPEN READY PR"}</button></div>
+        {pullRequestSetup.phase === "ready" && <><label>PR TITLE<input autoFocus value={pullRequestSetup.title} onChange={(event) => setPullRequestSetup({ ...pullRequestSetup, title: event.target.value })}/></label><label>DESCRIPTION<textarea value={pullRequestSetup.description} onChange={(event) => setPullRequestSetup({ ...pullRequestSetup, description: event.target.value })}/></label><DraftProvenance origin={pullRequestSetup}/></>}
+        <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setPullRequestSetup(null)}>CANCEL</button><button disabled={pullRequestSetup.phase === "loading" || !!busy} onClick={() => preparePullRequest(pullRequestSetup.draft)}>{busy === "pr-metadata" ? "DRAFTING…" : "REGENERATE"}</button><button className={styles.primary} disabled={pullRequestSetup.phase !== "ready" || !pullRequestSetup.title.trim() || !pullRequestSetup.description.trim() || !!busy} onClick={async () => { if (await gitAction("pr", { draft: pullRequestSetup.draft, title: pullRequestSetup.title, description: pullRequestSetup.description })) setPullRequestSetup(null); }}>{busy === "pr" ? "OPENING…" : pullRequestSetup.draft ? "OPEN DRAFT PR" : "OPEN READY PR"}</button></div>
       </section>
     </div>}
     {deleteTarget && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setDeleteTarget(null); }}>

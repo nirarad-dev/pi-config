@@ -29,7 +29,11 @@ export async function POST(request: Request) {
         })();
       const current = await snapshotChanges(cwd, approved.files);
       if (current.hash !== approved.hash) throw new Error("Changes moved since approval; review and draft the commit message again");
-      const patch = await run("git", ["diff", "--no-ext-diff", "HEAD", "--", ...approved.files], cwd);
+      const [patch, recentLog] = await Promise.all([
+        run("git", ["diff", "--no-ext-diff", "HEAD", "--", ...approved.files], cwd),
+        run("git", ["log", "-n", "10", "--no-merges", "--format=%s"], cwd).catch(() => ""),
+      ]);
+      const recentSubjects = recentLog.split("\n").map((subject) => subject.trim()).filter(Boolean);
       const fallback = buildSprintPilotCommitMessage(String(body.title || ""), approved.files, patch);
       if (!body.sessionId || !body.taskKey || !body.summary) return NextResponse.json({ message: fallback, approvalToken: approved.token, generatedBy: "fallback" });
       try {
@@ -38,14 +42,20 @@ export async function POST(request: Request) {
         const existing = getRpcSession(String(body.sessionId));
         const { session } = existing?.isAlive() ? { session: existing } : await startRpcSession(String(body.sessionId), sessionPath, undefined);
         await session.waitUntilReady?.();
-        const message = await generateSprintPilotCommitMessage(session.inner as unknown as AgentSession, {
+        const draft = await generateSprintPilotCommitMessage(session.inner as unknown as AgentSession, {
           taskKey: String(body.taskKey), summary: String(body.summary), taskDescription: typeof body.taskDescription === "string" ? body.taskDescription : undefined,
-          files: approved.files, patch, fallback,
+          files: approved.files, patch, recentSubjects, fallback,
         });
-        return NextResponse.json({ message, approvalToken: approved.token, generatedBy: "agent" });
-      } catch {
+        return NextResponse.json({ ...draft, approvalToken: approved.token });
+      } catch (error) {
         // A draft should remain available if the model is offline, times out, or its chat expired.
-        return NextResponse.json({ message: fallback, approvalToken: approved.token, generatedBy: "fallback" });
+        // Report why, so a silent fallback is never mistaken for the model's best effort.
+        return NextResponse.json({
+          message: fallback,
+          approvalToken: approved.token,
+          generatedBy: "fallback",
+          fallbackReason: error instanceof Error ? error.message : String(error),
+        });
       }
     }
 
