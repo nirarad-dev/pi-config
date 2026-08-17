@@ -58,6 +58,14 @@ test("the diff paints word-level detail under the highlighted text", () => {
   assert.match(css, /color:transparent/);
 });
 
+test("the text stacks above the underlay, which is opaque and absolutely positioned", () => {
+  // Without this the word backgrounds paint over the characters they mark and
+  // the line renders as blocks of colour — the ghost-character regression that
+  // arrived with the switch from translucent to opaque tones.
+  assert.match(css, /\.codeCell>code\{position:relative;z-index:1\}/);
+  assert.match(css, /\.changeUnderlay\{position:absolute/);
+});
+
 test("both layers share one padding box so the two stay aligned", () => {
   // The highlighter's inline padding was moved to the wrapper; leaving it in
   // place would offset every background by 8px.

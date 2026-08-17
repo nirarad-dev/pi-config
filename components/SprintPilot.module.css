@@ -177,6 +177,12 @@
 .codeCell{position:relative;display:block;min-width:0;padding:0 14px 0 8px}
 .changeUnderlay{position:absolute;top:0;left:0;right:0;bottom:0;padding:0 14px 0 8px;white-space:pre;color:transparent;pointer-events:none;overflow:hidden}
 .changeUnderlay mark{background:transparent;color:transparent;border-radius:2px}
+/* The underlay is absolutely positioned, so it paints over in-flow content.
+   That was harmless while its word backgrounds were translucent, but once they
+   became opaque to match the sampled tones they hid the characters they mark.
+   Lifting the text into the positioned layer above it fixes the order for both
+   the highlighted and the plain code paths. */
+.codeCell>code{position:relative;z-index:1}
 .wordAdded{background:var(--diff-add-word)!important}
 .wordRemoved{background:var(--diff-del-word)!important}
 /* Formatting-only keeps the side's hue at the faintest step, so a reflow still
