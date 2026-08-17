@@ -198,4 +198,9 @@
 .line_added .changeMark{color:#a3be8c;background:transparent}
 .line_removed .changeMark{color:#bf616a;background:transparent}
 .hunkHeader{background:#1c1c1c;color:#6f6f6f}
+/* Context numbers stay recessive; a changed line's number lifts and takes its
+   side's hue, so the gutter tells you which rows moved without reading them. */
 .oldLine,.newLine{color:#505050}
+.line_added .oldLine,.line_added .newLine{color:#7f9184}
+.line_removed .oldLine,.line_removed .newLine{color:#948084}
+.lineFormattingOnly .oldLine,.lineFormattingOnly .newLine{color:#6a6a6a}

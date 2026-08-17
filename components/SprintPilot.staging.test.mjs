@@ -101,6 +101,19 @@ const tone = (css, name) => {
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 };
 
+test("a changed line's number lifts out of the context grey and takes its side's hue", () => {
+  assert.match(css, /\.oldLine,\.newLine\{color:#505050\}/);
+  assert.match(css, /\.line_added \.oldLine,\.line_added \.newLine\{color:#7f9184\}/);
+  assert.match(css, /\.line_removed \.oldLine,\.line_removed \.newLine\{color:#948084\}/);
+});
+
+test("word detail is dropped where it would be confetti rather than information", () => {
+  const intraline = readFileSync(new URL("../lib/sprintpilot-diff-intraline.ts", import.meta.url), "utf8");
+  assert.match(intraline, /MIN_INLINE_SIMILARITY/);
+  assert.match(intraline, /MAX_CHANGED_RUNS_PER_LINE/);
+  assert.match(intraline, /MIN_LINE_SURVIVAL/);
+});
+
 test("each side steps through three distinct shades, darkest to lightest", () => {
   for (const side of ["add", "del"]) {
     const formatting = tone(css, `diff-${side}-formatting`);

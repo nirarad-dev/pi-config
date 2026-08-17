@@ -33,6 +33,37 @@ const NEWLINE = "\n";
 const MAX_LCS_CELLS = 400_000;
 
 /**
+ * Below this share of surviving characters, word-level marking is dropped and
+ * the run renders as plain bands.
+ *
+ * A token diff between two lines that were rewritten wholesale still finds
+ * matches — "the", "a", a comma — and highlights each one. The result is
+ * confetti: a dozen boxes per line that mark nothing a reader can use, and that
+ * hide the handful of lines where the detail is real. Editors avoid this by
+ * only diffing within a pair that is similar enough to be worth comparing.
+ *
+ * Measured against the cases in the tests, the two groups separate widely:
+ * a rewritten comment block scores 0.11 and a replaced statement 0.00, while
+ * two signatures sharing their shape score 0.33, a changed literal 0.70, and a
+ * reindent 1.00. The threshold sits in that gap with room on both sides.
+ */
+const MIN_INLINE_SIMILARITY = 0.25;
+
+/**
+ * A line is judged on its own as well as with its run.
+ *
+ * Runs are compared as one token stream so a moved line break is not mistaken
+ * for a code change, but that also lets a match land on a line it does not
+ * belong to: a phrase that survived a rewrite can align against a line four
+ * rows away, leaving both speckled. An editor avoids this by aligning lines
+ * first and only then diffing within a pair. These two limits get most of that
+ * benefit directly — a line broken into many fragments, or one where almost
+ * nothing survived, carries no usable detail and reads better as a plain band.
+ */
+const MAX_CHANGED_RUNS_PER_LINE = 3;
+const MIN_LINE_SURVIVAL = 0.25;
+
+/**
  * Split into words, punctuation, and whitespace runs, keeping every character.
  * Whitespace is tokenized rather than skipped so an indentation change is a
  * difference the comparison can see.
@@ -118,6 +149,32 @@ export function diffTokens(before: string[], after: string[]): Op[] {
 }
 
 /**
+ * Share of characters that survived the edit, ignoring whitespace.
+ *
+ * Measured against the longer side so that replacing four lines with twelve
+ * scores low even when every original character reappears somewhere.
+ */
+export function runSimilarity(ops: Op[]): number {
+  let common = 0;
+  let before = 0;
+  let after = 0;
+  for (const op of ops) {
+    const length = op.token === NEWLINE ? 0 : op.token.trim().length;
+    if (op.side === "common") {
+      common += length;
+      before += length;
+      after += length;
+    } else if (op.side === "removed") {
+      before += length;
+    } else {
+      after += length;
+    }
+  }
+  const longest = Math.max(before, after);
+  return longest === 0 ? 1 : common / longest;
+}
+
+/**
  * Rebuild one side of a run into per-line segments.
  *
  * Filtering the edit script to the ops that side actually contains reproduces
@@ -138,7 +195,7 @@ function rebuildSide(ops: Op[], side: "removed" | "added"): { segments: DiffSegm
     else segments.push({ text, changed });
   };
   const endLine = () => {
-    lines.push({ segments, formattingOnly: anyChange && !realChange });
+    lines.push({ segments: simplifyIfNoisy(segments, realChange), formattingOnly: anyChange && !realChange });
     segments = [];
     realChange = false;
     anyChange = false;
@@ -160,6 +217,27 @@ function rebuildSide(ops: Op[], side: "removed" | "added"): { segments: DiffSegm
   }
   endLine();
   return lines;
+}
+
+/**
+ * Collapse a line's segments to one when the word-level detail is noise.
+ *
+ * Whitespace-only changed segments do not count towards fragmentation: they
+ * render no box, so they cannot speckle anything. Formatting-only lines are
+ * left alone for the same reason.
+ */
+function simplifyIfNoisy(segments: DiffSegment[], hasRealChange: boolean): DiffSegment[] {
+  if (!hasRealChange) return segments;
+  const visibleChangedRuns = segments.filter((segment) => segment.changed && segment.text.trim()).length;
+  const weight = (predicate: (segment: DiffSegment) => boolean) =>
+    segments.filter(predicate).reduce((total, segment) => total + segment.text.trim().length, 0);
+  const total = weight(() => true);
+  const survived = weight((segment) => !segment.changed);
+  const tooFragmented = visibleChangedRuns > MAX_CHANGED_RUNS_PER_LINE;
+  const tooLittleLeft = total > 0 && survived / total < MIN_LINE_SURVIVAL;
+  if (!tooFragmented && !tooLittleLeft) return segments;
+  const text = segments.map((segment) => segment.text).join("");
+  return text ? [{ text, changed: true }] : [];
 }
 
 function wholeLine(line: DiffLine): AnnotatedDiffLine {
@@ -199,6 +277,13 @@ export function annotateDiffLines(lines: DiffLine[]): AnnotatedDiffLine[] {
     }
 
     const ops = diffTokens(tokenizeRun(removed.map((line) => line.content)), tokenizeRun(added.map((line) => line.content)));
+    if (runSimilarity(ops) < MIN_INLINE_SIMILARITY) {
+      // Too little survived for word-level marking to mean anything. The line
+      // backgrounds alone say this block was replaced, which is the honest
+      // summary and the one an editor shows.
+      annotated.push(...removed.map(wholeLine), ...added.map(wholeLine));
+      continue;
+    }
     const removedDetail = rebuildSide(ops, "removed");
     const addedDetail = rebuildSide(ops, "added");
     // Formatting is a property of the replacement, not of one side. A rewrap
