@@ -9,6 +9,9 @@ export async function GET(request: NextRequest) {
     const cwd = await assertSprintWorktree(request.nextUrl.searchParams.get("cwd"));
     const root = resolve(cwd, "automation/tests");
     const files: string[] = [];
+    // A worktree can be valid without the automation suite. Treat that as an
+    // empty test picker so unrelated workspace features (including diffs) stay usable.
+    if (!existsSync(root)) return NextResponse.json({ files });
     const walk = (directory: string) => {
       for (const entry of readdirSync(directory, { withFileTypes: true })) {
         if (entry.name.startsWith(".") || entry.name === "__pycache__") continue;

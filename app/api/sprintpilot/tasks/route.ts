@@ -5,6 +5,7 @@ export const dynamic = "force-dynamic";
 type JiraParent = { key?: string; fields?: { summary?: string } };
 type JiraFields = {
   summary?: string;
+  description?: unknown;
   status?: { name?: string; statusCategory?: { key?: string } };
   priority?: { name?: string };
   assignee?: { displayName?: string };
@@ -13,6 +14,20 @@ type JiraFields = {
   [field: string]: unknown;
 };
 type JiraIssue = { key: string; fields?: JiraFields };
+
+function jiraDescription(value: unknown): string | undefined {
+  const parts: string[] = [];
+  const visit = (entry: unknown) => {
+    if (typeof entry === "string") { parts.push(entry); return; }
+    if (!entry || typeof entry !== "object") return;
+    const node = entry as { text?: unknown; content?: unknown };
+    if (typeof node.text === "string") parts.push(node.text);
+    if (Array.isArray(node.content)) node.content.forEach(visit);
+  };
+  visit(value);
+  const description = parts.join(" ").replace(/\s+/g, " ").trim();
+  return description || undefined;
+}
 
 export async function GET() {
   const baseUrl = process.env.JIRA_BASE_URL?.replace(/\/$/, "");
@@ -28,7 +43,7 @@ export async function GET() {
     Accept: "application/json",
     Authorization: `Basic ${Buffer.from(`${email}:${token}`).toString("base64")}`,
   };
-  const fields = ["summary", "status", "priority", "assignee", "issuetype", "parent", legacyEpicLinkField].filter(Boolean).join(",");
+  const fields = ["summary", "description", "status", "priority", "assignee", "issuetype", "parent", legacyEpicLinkField].filter(Boolean).join(",");
   const issues: JiraIssue[] = [];
   const seenTokens = new Set<string>();
   let nextPageToken: string | undefined;
@@ -80,6 +95,7 @@ export async function GET() {
     return {
       key: issue.key,
       summary: String(fields?.summary || "Untitled Jira issue"),
+      description: jiraDescription(fields?.description),
       status: String(fields?.status?.name || "Unknown"),
       statusCategory: fields?.status?.statusCategory?.key,
       priority: String(fields?.priority?.name || "Normal"),

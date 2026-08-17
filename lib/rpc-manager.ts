@@ -209,9 +209,10 @@ export class AgentSessionWrapper {
     return this._alive && (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning);
   }
 
-  getMonitorState(): { running: boolean; needsUserInput: boolean; lastPromptFinishedAt?: number } {
+  getMonitorState(): { running: boolean; queued: boolean; needsUserInput: boolean; lastPromptFinishedAt?: number } {
     return {
       running: this.isRunning(),
+      queued: this.pendingPromptCount > 1,
       needsUserInput: this.pendingUiRequests.size > 0,
       lastPromptFinishedAt: this.lastPromptFinishedAt,
     };

@@ -61,6 +61,7 @@ export function resolveTestArgs(preset: TestPreset, optionIds: string[]): string
 export type SprintTask = {
   key: string;
   summary: string;
+  description?: string;
   status: string;
   statusCategory?: string;
   priority: string;

@@ -1,6 +1,16 @@
 import { NextResponse } from "next/server";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { buildSprintPilotCommitMessage } from "@/lib/sprintpilot-commit-message";
+import { generateSprintPilotCommitMessage } from "@/lib/sprintpilot-commit-metadata";
+import { checkSprintPilotPullRequestInJira } from "@/lib/sprintpilot-jira-links";
+import { appendArnacAiDisclosure, sprintPilotJiraUrl } from "@/lib/sprintpilot-pr-metadata";
+import { getRpcSession, startRpcSession } from "@/lib/rpc-manager";
+import { resolveSessionPath } from "@/lib/session-reader";
 import { assertSprintWorktree, createApproval, readApproval, run, snapshotChanges, takeApproval } from "@/lib/sprintpilot-server";
+
+function jiraKeyFromBranch(branch: string) {
+  return branch.match(/(?:^|\/)([A-Z][A-Z0-9]+-\d+)(?:-|$)/)?.[1];
+}
 
 export async function POST(request: Request) {
   try {
@@ -8,18 +18,35 @@ export async function POST(request: Request) {
     const action = String(body.action || "");
     const cwd = await assertSprintWorktree(body.cwd);
 
-    if (action === "approve") {
-      const snapshot = await snapshotChanges(cwd, body.files);
-      return NextResponse.json({ approvalToken: createApproval(cwd, snapshot.files, snapshot.hash), hash: snapshot.hash });
-    }
-
     if (action === "commit-message") {
-      const approval = readApproval(body.approvalToken);
-      if (approval.cwd !== cwd) throw new Error("Approval belongs to another worktree");
-      const current = await snapshotChanges(cwd, approval.files);
-      if (current.hash !== approval.hash) throw new Error("Changes moved since approval; review and approve them again");
-      const patch = await run("git", ["diff", "--no-ext-diff", "HEAD", "--", ...approval.files], cwd);
-      return NextResponse.json({ message: buildSprintPilotCommitMessage(String(body.title || ""), approval.files, patch) });
+      const existingApproval = body.approvalToken ? readApproval(body.approvalToken) : undefined;
+      if (existingApproval && existingApproval.cwd !== cwd) throw new Error("Approval belongs to another worktree");
+      const approved = existingApproval
+        ? { files: existingApproval.files, hash: existingApproval.hash, token: String(body.approvalToken) }
+        : await (async () => {
+          const snapshot = await snapshotChanges(cwd, body.files);
+          return { ...snapshot, token: createApproval(cwd, snapshot.files, snapshot.hash) };
+        })();
+      const current = await snapshotChanges(cwd, approved.files);
+      if (current.hash !== approved.hash) throw new Error("Changes moved since approval; review and draft the commit message again");
+      const patch = await run("git", ["diff", "--no-ext-diff", "HEAD", "--", ...approved.files], cwd);
+      const fallback = buildSprintPilotCommitMessage(String(body.title || ""), approved.files, patch);
+      if (!body.sessionId || !body.taskKey || !body.summary) return NextResponse.json({ message: fallback, approvalToken: approved.token, generatedBy: "fallback" });
+      try {
+        const sessionPath = await resolveSessionPath(String(body.sessionId));
+        if (!sessionPath) throw new Error("The task chat no longer exists");
+        const existing = getRpcSession(String(body.sessionId));
+        const { session } = existing?.isAlive() ? { session: existing } : await startRpcSession(String(body.sessionId), sessionPath, undefined);
+        await session.waitUntilReady?.();
+        const message = await generateSprintPilotCommitMessage(session.inner as unknown as AgentSession, {
+          taskKey: String(body.taskKey), summary: String(body.summary), taskDescription: typeof body.taskDescription === "string" ? body.taskDescription : undefined,
+          files: approved.files, patch, fallback,
+        });
+        return NextResponse.json({ message, approvalToken: approved.token, generatedBy: "agent" });
+      } catch {
+        // A draft should remain available if the model is offline, times out, or its chat expired.
+        return NextResponse.json({ message: fallback, approvalToken: approved.token, generatedBy: "fallback" });
+      }
     }
 
     if (action === "commit") {
@@ -37,19 +64,33 @@ export async function POST(request: Request) {
     if (action === "push") {
       const branch = (await run("git", ["branch", "--show-current"], cwd)).trim();
       if (!branch) throw new Error("Cannot push a detached HEAD");
+      const taskKey = jiraKeyFromBranch(branch);
+      if (!taskKey) throw new Error("Branch must contain its Jira key before push (for example, nir/DEV-12345-short-title)");
       const output = await run("git", ["push", "--set-upstream", "origin", branch], cwd);
-      return NextResponse.json({ success: true, output, branch });
+      return NextResponse.json({ success: true, output, branch, taskKey });
     }
 
     if (action === "pr") {
       const title = String(body.title || "").trim();
       const description = String(body.description || "").trim();
       if (!title) throw new Error("PR title is required");
-      const bodyText = description || "Created with SprintPilot and Pi. AI assistance used; all changes were explicitly reviewed and approved by the author.";
-      const args = ["pr", "create", "--title", title, "--body", bodyText];
+      const titleTicket = title.match(/^\[[A-Z][^\]\r\n]+\]\s+\[(DEV-\d+)\]\s+\S/);
+      if (!titleTicket) throw new Error("PR title must use the repository format: [Component] [DEV-12345] Short description");
+      const branch = (await run("git", ["branch", "--show-current"], cwd)).trim();
+      const branchTicket = jiraKeyFromBranch(branch);
+      if (branchTicket !== titleTicket[1]) throw new Error(`PR title Jira key ${titleTicket[1]} must match branch Jira key ${branchTicket || "(missing)"}`);
+      if (!description || !description.includes("## Description") || !description.includes("## Tickets")) {
+        throw new Error("PR description must include Description and Tickets sections");
+      }
+      const ticketLink = `[${titleTicket[1]}](${sprintPilotJiraUrl(titleTicket[1])})`;
+      if (!description.includes(ticketLink)) throw new Error("PR Tickets must link to the Jira issue that appears in the title");
+      const bodyText = appendArnacAiDisclosure(description);
+      const args = ["pr", "create", "--assignee", "@me", "--title", title, "--body", bodyText];
       if (body.draft === true) args.push("--draft");
       const output = await run("gh", args, cwd);
-      return NextResponse.json({ success: true, url: output.split(/\s+/).find((value) => value.startsWith("http")) || output, draft: body.draft === true });
+      const url = output.split(/\s+/).find((value) => value.startsWith("http")) || output;
+      const jiraDevelopment = await checkSprintPilotPullRequestInJira(titleTicket[1]);
+      return NextResponse.json({ success: true, url, draft: body.draft === true, jiraDevelopment });
     }
 
     throw new Error("Unknown git action");

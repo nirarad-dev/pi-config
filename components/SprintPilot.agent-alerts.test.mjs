@@ -8,13 +8,18 @@ test("polls each task-scoped session for completion and input requests", () => {
   assert.match(source, /taskRuntime\.sessionId \? \[\{ key, sessionId: taskRuntime\.sessionId \}\]/);
   assert.match(source, /\/api\/sprintpilot\/agent-status\?ids=/);
   assert.match(source, /snapshot\.needsUserInput/);
+  assert.match(source, /snapshot\.queued/);
   assert.match(source, /lastPromptFinishedAt/);
   assert.match(source, /setInterval\(pollAgentStates, 2_000\)/);
 });
 
 test("renders the alert on its relevant Jira ticket card", () => {
   assert.match(source, /agentAlerts\[item\.key\]/);
-  assert.match(source, /INPUT NEEDED/);
-  assert.match(source, /AGENT FINISHED/);
+  assert.match(source, /AGENT_RAIL_STATUS/);
+  assert.match(source, /NEEDS INPUT/);
+  assert.match(source, /WORKING/);
+  assert.match(source, /QUEUED/);
+  assert.match(source, /READY/);
+  assert.match(source, /IDLE/);
   assert.match(source, /clearFinishedAlert\(key\)/);
 });

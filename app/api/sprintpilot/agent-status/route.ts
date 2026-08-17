@@ -14,7 +14,7 @@ export async function GET(request: Request) {
     const session = getRpcSession(id);
     return [id, session?.isAlive()
       ? session.getMonitorState()
-      : { running: false, needsUserInput: false }];
+      : { running: false, queued: false, needsUserInput: false }];
   }));
   return NextResponse.json({ statuses });
 }

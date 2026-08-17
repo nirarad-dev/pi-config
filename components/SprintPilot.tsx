@@ -11,6 +11,7 @@ import { sprintPilotDiffTokenStyles } from "@/lib/sprintpilot-highlight";
 import { buildReviewFixPrompt, type ReviewComment } from "@/lib/sprintpilot-review";
 import { sprintPilotDiffLanguage } from "@/lib/sprintpilot-syntax";
 import type { ProviderRateLimits, SprintPilotUsage } from "@/lib/sprintpilot-usage";
+import { AgentCommandError, sendAgentCommand } from "@/lib/agent-client";
 import { DirectoryPicker } from "./DirectoryPicker";
 import { FolderIcon, getFileIcon } from "./FileIcons";
 import styles from "./SprintPilot.module.css";
@@ -47,12 +48,15 @@ type AuthSetup = {
   options?: { id: string; label: string }[];
 };
 type CommitSetup = { phase: "loading" | "ready" | "error"; message: string; error?: string };
+type PullRequestSetup = { phase: "loading" | "ready" | "error"; draft: boolean; title: string; description: string; error?: string };
 type AgentAlert = "finished" | "attention";
 type AgentStatusSnapshot = {
   running: boolean;
+  queued: boolean;
   needsUserInput: boolean;
   lastPromptFinishedAt?: number;
 };
+type AgentRailStatus = "working" | "queued" | "needs-input" | "ready" | "idle";
 type TaskRuntime = {
   worktree?: string;
   branch?: string;
@@ -102,6 +106,23 @@ function providerLabel(provider: string) {
   if (value.includes("openai") || value.includes("codex")) return "Codex";
   return provider;
 }
+
+function agentRailStatus(snapshot: AgentStatusSnapshot | undefined, alert: AgentAlert | undefined): AgentRailStatus | undefined {
+  if (!snapshot && !alert) return undefined;
+  if (snapshot?.needsUserInput || alert === "attention") return "needs-input";
+  if (snapshot?.queued) return "queued";
+  if (snapshot?.running) return "working";
+  if (alert === "finished") return "ready";
+  return "idle";
+}
+
+const AGENT_RAIL_STATUS: Record<AgentRailStatus, { label: string; title: string }> = {
+  working: { label: "WORKING", title: "The task agent is working" },
+  queued: { label: "QUEUED", title: "A follow-up is queued after current agent work" },
+  "needs-input": { label: "NEEDS INPUT", title: "The task agent is waiting for your input" },
+  ready: { label: "READY", title: "The task agent finished its latest work" },
+  idle: { label: "IDLE", title: "The task chat is open and waiting" },
+};
 
 function isDefaultModel(model: ModelEntry) {
   return model.provider === DEFAULT_PROVIDER && model.id === DEFAULT_MODEL;
@@ -341,6 +362,7 @@ export function SprintPilot() {
   const [historyCommitCount, setHistoryCommitCount] = useState(0);
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyCollapsed, setHistoryCollapsed] = useState(false);
   const [collapsedChangeFolders, setCollapsedChangeFolders] = useState<Set<string>>(() => new Set());
   const [developmentOpen, setDevelopmentOpen] = useState(true);
   const [notice, setNotice] = useState("");
@@ -354,7 +376,9 @@ export function SprintPilot() {
   const [restartStep, setRestartStep] = useState<WorkflowStep | null>(null);
   const [authSetup, setAuthSetup] = useState<AuthSetup | null>(null);
   const [commitSetup, setCommitSetup] = useState<CommitSetup | null>(null);
+  const [pullRequestSetup, setPullRequestSetup] = useState<PullRequestSetup | null>(null);
   const [agentAlerts, setAgentAlerts] = useState<Record<string, AgentAlert>>({});
+  const [agentStates, setAgentStates] = useState<Record<string, AgentStatusSnapshot>>({});
   const authEvents = useRef<EventSource | null>(null);
   const jiraSyncing = useRef(false);
   const agentStatusRef = useRef(new Map<string, { running: boolean; lastFinishedAt?: number }>());
@@ -388,6 +412,17 @@ export function SprintPilot() {
       return next;
     });
   }, []);
+
+  useEffect(() => {
+    const receiveSelectedSession = (event: MessageEvent<unknown>) => {
+      if (event.origin !== window.location.origin || !event.data || typeof event.data !== "object") return;
+      const data = event.data as { source?: string; type?: string; sessionId?: string; cwd?: string };
+      if (data.source !== "pi-web" || data.type !== "session-selected" || data.cwd !== state.worktree || !data.sessionId) return;
+      if (data.sessionId !== state.sessionId) updateRuntime({ sessionId: data.sessionId });
+    };
+    window.addEventListener("message", receiveSelectedSession);
+    return () => window.removeEventListener("message", receiveSelectedSession);
+  }, [state.sessionId, state.worktree, updateRuntime]);
 
   const syncJiraTasks = useCallback(async ({ announce = false, worktrees = [] }: {
     announce?: boolean;
@@ -491,6 +526,18 @@ export function SprintPilot() {
         const result = await jsonRequest<{ statuses: Record<string, AgentStatusSnapshot> }>(`/api/sprintpilot/agent-status?ids=${encodeURIComponent(sessionIds.join(","))}`);
         const snapshots = taskAgentSessions.map(({ key, sessionId }) => ({ key, sessionId, snapshot: result.statuses[sessionId] }));
         if (cancelled) return;
+        setAgentStates((current) => {
+          const next = { ...current };
+          let changed = false;
+          for (const { key, snapshot } of snapshots) {
+            if (!snapshot) continue;
+            const previous = current[key];
+            if (previous?.running === snapshot.running && previous?.queued === snapshot.queued && previous?.needsUserInput === snapshot.needsUserInput && previous?.lastPromptFinishedAt === snapshot.lastPromptFinishedAt) continue;
+            next[key] = snapshot;
+            changed = true;
+          }
+          return changed ? next : current;
+        });
         setAgentAlerts((current) => {
           const next = { ...current };
           let changed = false;
@@ -653,28 +700,53 @@ export function SprintPilot() {
     }
     const completed = normalizeCompletedSteps(state.completed, [step]);
     updateRuntime({ completed });
-    setNotice(`${step} marked complete for ${task?.key}. Click it again to start a fresh Pi session.`);
+    setNotice(`${step} marked complete for ${task?.key}. Click it again to send that workflow step to the task agent.`);
   };
 
   const restartCompletedStep = async () => {
     if (!restartStep) return;
     const step = restartStep;
     setRestartStep(null);
-    await runPiAction(step);
+    await sendWorkflowPrompt(step);
   };
 
-  const runPiAction = async (step: WorkflowStep) => {
+  const createTaskSession = async () => {
+    if (!state.worktree || !state.provider || !state.modelId) throw new Error("Choose a worktree and model before opening the task chat");
+    const result = await jsonRequest<{ sessionId: string }>("/api/agent/new", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: state.worktree, type: "ensure_session", provider: state.provider, modelId: state.modelId, thinkingLevel: state.effort }),
+    });
+    updateRuntime({ sessionId: result.sessionId });
+    setDevelopmentOpen(true);
+    return result.sessionId;
+  };
+
+  const ensureTaskSession = async (fresh = false) => fresh || !state.sessionId
+    ? createTaskSession()
+    : state.sessionId;
+
+  const queueTaskPrompt = async (message: string, fresh = false) => {
+    let sessionId = await ensureTaskSession(fresh);
+    try {
+      await sendAgentCommand(sessionId, { type: "prompt", message, streamingBehavior: "followUp" });
+    } catch (error) {
+      // A manually deleted/expired session should not strand this Jira task.
+      if (!(error instanceof AgentCommandError) || error.status !== 404 || fresh) throw error;
+      sessionId = await createTaskSession();
+      await sendAgentCommand(sessionId, { type: "prompt", message, streamingBehavior: "followUp" });
+    }
+    return sessionId;
+  };
+
+  const sendWorkflowPrompt = async (step: WorkflowStep) => {
     if (!task || !state.worktree || !state.provider || !state.modelId || !actionPrompts[step]) return;
     clearFinishedAlert(task.key);
     setBusy(step);
     try {
-      const result = await jsonRequest<{ sessionId: string }>("/api/agent/new", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd: state.worktree, type: "prompt", message: actionPrompts[step](task), provider: state.provider, modelId: state.modelId, thinkingLevel: state.effort }),
-      });
-      updateRuntime({ sessionId: result.sessionId, completed: normalizeCompletedSteps(state.completed, [step]) });
-      setNotice(`${step} started with ${providerLabel(state.provider)} · ${state.modelId} · ${state.effort}.`);
+      const sessionId = await queueTaskPrompt(actionPrompts[step](task));
+      updateRuntime({ sessionId, completed: normalizeCompletedSteps(state.completed, [step]) });
+      setNotice(`${step} sent to the task agent. It will run next if the agent is already busy.`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
@@ -682,25 +754,25 @@ export function SprintPilot() {
     }
   };
 
-  const startDevelopmentSession = async () => {
+  const openTaskConversation = async (fresh = false) => {
     if (!task || !state.worktree || !state.provider || !state.modelId) return;
     clearFinishedAlert(task.key);
-    setBusy("development-session");
+    setBusy(fresh ? "fresh-development-session" : "development-session");
     try {
-      const result = await jsonRequest<{ sessionId: string }>("/api/agent/new", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd: state.worktree, type: "ensure_session", provider: state.provider, modelId: state.modelId, thinkingLevel: state.effort }),
-      });
-      updateRuntime({ sessionId: result.sessionId });
+      const sessionId = await ensureTaskSession(fresh);
+      updateRuntime({ sessionId });
       setDevelopmentOpen(true);
-      setNotice(`Development conversation started for ${task.key}.`);
+      setNotice(fresh ? `New task chat opened for ${task.key}.` : `Task chat ready for ${task.key}.`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     } finally {
       setBusy(null);
     }
   };
+
+  const startDevelopmentSession = () => openTaskConversation();
+
+  const startFreshDevelopmentSession = () => openTaskConversation(true);
 
   const openCreateWorktree = async () => {
     setCreateWorktreeSetup({ loading: true, sources: [] });
@@ -809,23 +881,7 @@ export function SprintPilot() {
 
     setBusy("review-comments");
     try {
-      let sessionId = state.sessionId;
-      if (!sessionId) {
-        const result = await jsonRequest<{ sessionId: string }>("/api/agent/new", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ cwd: state.worktree, type: "ensure_session", provider: state.provider, modelId: state.modelId, thinkingLevel: state.effort }),
-        });
-        sessionId = result.sessionId;
-        updateRuntime({ sessionId });
-        setDevelopmentOpen(true);
-      }
-
-      await jsonRequest(`/api/agent/${encodeURIComponent(sessionId)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type: "prompt", message }),
-      });
+      const sessionId = await queueTaskPrompt(message);
 
       const sentIds = new Set(pending.map((comment) => comment.id));
       const sentAt = new Date().toISOString();
@@ -860,11 +916,10 @@ export function SprintPilot() {
     if (!state.worktree || !task) return;
     setBusy(action);
     try {
-      const result = await jsonRequest<{ approvalToken?: string; output?: string; url?: string }>("/api/sprintpilot/git", {
+      const result = await jsonRequest<{ approvalToken?: string; output?: string; url?: string; jiraDevelopment?: { state: "linked" | "pending" | "unavailable"; error?: string } }>("/api/sprintpilot/git", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action, cwd: state.worktree, files: state.selectedFiles, approvalToken: state.approvalToken, title: `${task.key}: ${task.summary}`, ...extra }),
       });
-      if (action === "approve") updateRuntime({ approvalToken: result.approvalToken, completed: normalizeCompletedSteps(state.completed, ["Approve"]) });
       if (action === "commit") {
         setCommitSetup(null);
         setActiveDiffFile(undefined);
@@ -878,27 +933,54 @@ export function SprintPilot() {
         }
       }
       if (action === "push") updateRuntime({ completed: normalizeCompletedSteps(state.completed, ["Push"]) });
-      if (action === "pr") updateRuntime({ completed: normalizeCompletedSteps(state.completed, ["Open PR"]) });
+      if (action === "pr") {
+        updateRuntime({ completed: normalizeCompletedSteps(state.completed, ["Open PR"]) });
+        const jiraState = result.jiraDevelopment;
+        if (jiraState?.state === "linked") setNotice(`${result.url || "Pull request created"} · Jira Development link confirmed.`);
+        else if (jiraState?.state === "pending") setNotice(`${result.url || "Pull request created"} · GitHub for Atlassian has not ingested the PR yet. If it remains missing, run the official GitHub backfill in Jira.`);
+        else setNotice(`${result.url || "Pull request created"} · Jira Development verification unavailable${jiraState?.error ? `: ${jiraState.error}` : "."}`);
+        return true;
+      }
       setNotice(result.url || result.output || (action === "approve" ? "Selection approved. The token expires in 30 minutes and becomes invalid if any selected file changes." : `${action} complete.`));
-    } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); }
+      return true;
+    } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); return false; }
     finally { setBusy(null); }
   };
 
   const prepareCommit = async () => {
-    if (!state.worktree || !state.approvalToken || !task) return;
+    if (!state.worktree || !state.selectedFiles.length || !task) return;
     setCommitSetup({ phase: "loading", message: "" });
     setBusy("commit-message");
     try {
-      const result = await jsonRequest<{ message: string }>("/api/sprintpilot/git", {
+      const sessionId = await ensureTaskSession();
+      const result = await jsonRequest<{ message: string; approvalToken: string }>("/api/sprintpilot/git", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "commit-message", cwd: state.worktree, approvalToken: state.approvalToken, title: `${task.key}: ${task.summary}` }),
+        body: JSON.stringify({ action: "commit-message", cwd: state.worktree, files: state.selectedFiles, approvalToken: state.approvalToken, sessionId, taskKey: task.key, summary: task.summary, taskDescription: task.description, title: `${task.key}: ${task.summary}` }),
       });
+      updateRuntime({ sessionId, approvalToken: result.approvalToken });
       setCommitSetup({ phase: "ready", message: result.message });
     } catch (error) {
       setCommitSetup({ phase: "error", message: "", error: error instanceof Error ? error.message : String(error) });
     } finally {
       setBusy(null);
     }
+  };
+
+  const preparePullRequest = async (draft: boolean) => {
+    if (!task || !state.worktree || !state.provider || !state.modelId) return;
+    setPullRequestSetup({ phase: "loading", draft, title: "", description: "" });
+    setBusy("pr-metadata");
+    try {
+      const sessionId = await ensureTaskSession();
+      const metadata = await jsonRequest<{ title: string; description: string }>("/api/sprintpilot/pr-metadata", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd: state.worktree, sessionId, taskKey: task.key, summary: task.summary, taskDescription: task.description }),
+      });
+      updateRuntime({ sessionId });
+      setPullRequestSetup({ phase: "ready", draft, title: metadata.title, description: metadata.description });
+    } catch (error) {
+      setPullRequestSetup({ phase: "error", draft, title: "", description: "", error: error instanceof Error ? error.message : String(error) });
+    } finally { setBusy(null); }
   };
 
   const providerGroups = useMemo(() => [...new Set(models.map((model) => model.provider))], [models]);
@@ -944,12 +1026,13 @@ export function SprintPilot() {
         {!jiraConfigured && <p className={styles.jiraWarning}><b>DEMO DATA</b> Jira is not connected. Copy <code>sprintpilot.env.example</code> to <code>.env.local</code>, add your Jira email and API token, then restart the app.</p>}
         <div className={styles.taskList}>{tasks.map((item) => {
           const agentAlert = agentAlerts[item.key];
+          const status = agentRailStatus(agentStates[item.key], agentAlert);
           return <button key={item.key} className={`${styles.taskCard} ${item.key === activeKey ? styles.activeTask : ""} ${agentAlert === "attention" ? styles.taskCardAgentAttention : agentAlert === "finished" ? styles.taskCardAgentFinished : ""}`} onClick={() => openTask(item.key)}>
           <span className={styles.taskMeta}><span className={styles.keyIdentity}><IssueTypeIcon type={item.issueType}/><b>{item.key}</b><small>{item.issueType || "Task"}</small></span><i>{item.priority}</i></span>
           {item.epicName && <span className={styles.taskEpic}><IssueTypeIcon epic/><b>EPIC</b><strong>{item.epicKey}</strong><span>{item.epicName}</span></span>}
           <span className={styles.taskTitle}>{item.summary}</span>
           <span className={styles.taskStatus}>{item.status}</span>
-          {agentAlert && <span className={`${styles.taskAgentSignal} ${agentAlert === "attention" ? styles.taskAgentNeedsInput : styles.taskAgentFinished}`}><i/>{agentAlert === "attention" ? "INPUT NEEDED" : "AGENT FINISHED"}</span>}
+          {status && <span className={`${styles.taskAgentSignal} ${styles[`taskAgent_${status}`]}`} title={AGENT_RAIL_STATUS[status].title}><i/>{AGENT_RAIL_STATUS[status].label}</span>}
         </button>})}</div>
       </aside>
 
@@ -985,20 +1068,20 @@ export function SprintPilot() {
           <div className={styles.flow}>{WORKFLOW_STEPS.map((step, index) => {
             const completed = state.completed.includes(step);
             const jiraSynced = task ? completedStepsForJiraStatus(task.status).includes(step) : false;
-            return <button type="button" key={step} className={completed ? styles.flowDone : ""} aria-pressed={completed} disabled={!!busy} title={completed ? `${step} is complete${jiraSynced ? ` from Jira status ${task.status}` : ""}. Click to start a new session.` : `Mark ${step} complete.`} onClick={() => handleFlowStep(step)}><span>{completed ? "✓" : String(index + 1).padStart(2, "0")}</span><b>{step}</b></button>;
+            return <button type="button" key={step} className={completed ? styles.flowDone : ""} aria-pressed={completed} disabled={!!busy} title={completed ? `${step} is complete${jiraSynced ? ` from Jira status ${task.status}` : ""}. Click to queue it in the task chat.` : `Mark ${step} complete.`} onClick={() => handleFlowStep(step)}><span>{completed ? "✓" : String(index + 1).padStart(2, "0")}</span><b>{step}</b></button>;
           })}</div>
-          <p className={styles.flowHint}>Click an incomplete step to mark it done. Completed steps open a new-session confirmation. Jira “In CR” completes Plan and Develop.</p>
+          <p className={styles.flowHint}>Click an incomplete step to mark it done. Click a completed step to queue that workflow step in the task conversation. Jira “In CR” completes Plan and Develop.</p>
 
           <div className={styles.grid}>
             <section className={`${styles.panel} ${styles.developmentPanel}`}>
-              <div className={styles.panelHead}><span>DEVELOPMENT CONVERSATION</span><small>{state.sessionId ? `${providerLabel(state.provider || "")} · ${state.modelId}` : "TASK-SCOPED PI SESSION"}</small></div>
+              <div className={styles.panelHead}><span>TASK CONVERSATION</span><small>{state.sessionId ? `${providerLabel(state.provider || "")} · ${state.modelId}` : "ONE PI SESSION PER TASK"}</small></div>
               {!state.worktree ? <div className={styles.developmentEmpty}><p>Link or create a worktree to start a development conversation for this Jira task.</p></div>
-                : !state.sessionId ? <div className={styles.developmentEmpty}><p>Talk to the selected model without leaving SprintPilot. The session runs in this task&apos;s worktree and follows the current model and effort settings.</p><button className={styles.primary} disabled={!!busy || !state.provider || !state.modelId} onClick={startDevelopmentSession}>{busy === "development-session" ? "STARTING…" : "START DEVELOPMENT CONVERSATION"}</button></div>
-                  : <><div className={styles.developmentToolbar}><span>● CHATS SCOPED TO {state.worktree}</span><button onClick={() => setDevelopmentOpen((open) => !open)}>{developmentOpen ? "COLLAPSE" : "EXPAND"}</button><a href={`/chat?session=${encodeURIComponent(state.sessionId)}`}>OPEN FULL PI CHAT ↗</a></div>{developmentOpen && <iframe className={styles.developmentFrame} title={`${task.key} worktree conversations`} src={`/chat?session=${encodeURIComponent(state.sessionId)}&embedded=1&palette=sprintpilot&scopeCwd=${encodeURIComponent(state.worktree)}`}/>}</>}
+                : !state.sessionId ? <div className={styles.developmentEmpty}><p>Open one task conversation. Workflow shortcuts, review comments, and your own messages all use it, so context stays in one place.</p><button className={styles.primary} disabled={!!busy || !state.provider || !state.modelId} onClick={startDevelopmentSession}>{busy === "development-session" ? "OPENING…" : "OPEN TASK CHAT"}</button></div>
+                  : <><div className={styles.developmentToolbar}><span>● TASK CHAT · {agentAlerts[task.key] === "attention" ? "INPUT NEEDED" : agentAlerts[task.key] === "finished" ? "READY FOR NEXT STEP" : "CHATS SCOPED TO THIS WORKTREE"}</span><button onClick={() => setDevelopmentOpen((open) => !open)}>{developmentOpen ? "COLLAPSE" : "EXPAND"}</button><button disabled={!!busy} onClick={startFreshDevelopmentSession}>{busy === "fresh-development-session" ? "OPENING…" : "NEW CLEAN CHAT"}</button><a href={`/chat?session=${encodeURIComponent(state.sessionId)}`}>OPEN FULL PI CHAT ↗</a></div><div className={styles.agentShortcutBar}><span>QUEUE IN TASK CHAT</span>{AGENT_STEPS.map((step) => <button key={step} disabled={!!busy} onClick={() => sendWorkflowPrompt(step)}>{busy === step ? "QUEUING…" : step}</button>)}<small>Running work is queued after the current task completes.</small></div>{developmentOpen && <iframe className={styles.developmentFrame} title={`${task.key} worktree conversations`} src={`/chat?session=${encodeURIComponent(state.sessionId)}&embedded=1&palette=sprintpilot&scopeCwd=${encodeURIComponent(state.worktree)}`}/>}</>}
             </section>
 
             <section className={`${styles.panel} ${styles.changesPanel}`}>
-              <div className={styles.panelHead}><span>REVIEW FILES &amp; APPROVE COMMIT</span><small className={state.approvalToken ? styles.approvedState : styles.pendingState}>{state.approvalToken ? `✓ ${state.selectedFiles.length} FILES APPROVED` : `${gitFiles.length} CHANGED · NOT APPROVED`}</small></div>
+              <div className={styles.panelHead}><span>REVIEW FILES &amp; COMMIT</span><small className={state.approvalToken ? styles.approvedState : styles.pendingState}>{state.approvalToken ? `✓ ${state.selectedFiles.length} FILES READY` : `${gitFiles.length} CHANGED · SELECT FILES`}</small></div>
               <div className={styles.reviewTools}><button disabled={!gitFiles.length || !!busy} onClick={() => updateRuntime({ approvalToken: undefined, selectedFiles: changedFilePaths })}>SELECT ALL</button><button disabled={!state.selectedFiles.length || !!busy} onClick={() => updateRuntime({ approvalToken: undefined, selectedFiles: [] })}>CLEAR</button><button disabled={!state.worktree || !!busy} onClick={() => refreshWorkspace().then(() => setNotice("Pending changes refreshed.")).catch((error) => setNotice(error.message))}>REFRESH CHANGES</button><span>{state.selectedFiles.length} OF {gitFiles.length} SELECTED</span></div>
               <div className={styles.changeLayout}>
                 <div className={styles.fileExplorer}><div className={styles.explorerHead}><span>CHANGES</span><b>{gitFiles.length}</b></div><div className={styles.fileList}>{gitFiles.length ? <ChangeTree
@@ -1030,24 +1113,17 @@ export function SprintPilot() {
                 <div><b>{pendingReviewComments.length ? `${pendingReviewComments.length} REVIEW ${pendingReviewComments.length === 1 ? "COMMENT" : "COMMENTS"} READY` : "NO UNSENT REVIEW COMMENTS"}</b><span>Use the + control beside a changed line to attach a precise fix reference.</span></div>
                 <button className={styles.sendReviewButton} disabled={!pendingReviewComments.length || !state.worktree || !state.provider || !state.modelId || !!busy} onClick={sendReviewComments}>{busy === "review-comments" ? "SENDING TO AGENT…" : `SEND ${pendingReviewComments.length || ""} TO AGENT`}</button>
               </div>
-              <div className={styles.approvalNote}>{state.approvalToken ? <span className={styles.approvedState}>✓ Approval is bound to the selected file contents for 30 minutes.</span> : <span>Select files, inspect their patches, then approve their exact contents before commit is enabled.</span>}</div>
+              <div className={styles.approvalNote}>{state.approvalToken ? <span className={styles.approvedState}>✓ The reviewed message is bound to the selected file contents for 30 minutes.</span> : <span>Select files and review their patches. Generating the commit message captures the exact contents for commit.</span>}</div>
               <div className={styles.gitGates}>
-                <button disabled={!state.selectedFiles.length || !!busy} onClick={() => gitAction("approve")}>1 · APPROVE FILES FOR COMMIT</button>
-                <button disabled={!state.approvalToken || !!busy} onClick={prepareCommit}>2 · REVIEW COMMIT MESSAGE</button>
-                <button disabled={!state.worktree || !!busy} onClick={() => gitAction("push")}>3 · PUSH BRANCH</button>
-                <div className={styles.prSplit}><button disabled={!state.worktree || !!busy} onClick={() => gitAction("pr", { draft: true })}>4A · OPEN DRAFT PR</button><button disabled={!state.worktree || !!busy} onClick={() => gitAction("pr", { draft: false })}>4B · OPEN READY PR</button></div>
+                <button disabled={!state.selectedFiles.length || !!busy} onClick={prepareCommit}>1 · REVIEW COMMIT MESSAGE</button>
+                <button disabled={!state.worktree || !!busy} onClick={() => gitAction("push")}>2 · PUSH BRANCH</button>
+                <div className={styles.prSplit}><button disabled={!state.worktree || !state.provider || !state.modelId || !!busy} onClick={() => preparePullRequest(true)}>3A · DRAFT PR DETAILS</button><button disabled={!state.worktree || !state.provider || !state.modelId || !!busy} onClick={() => preparePullRequest(false)}>3B · READY PR DETAILS</button></div>
               </div>
             </section>
 
             <section className={`${styles.panel} ${styles.historyPanel}`}>
-              <div className={styles.panelHead}><span>GIT HISTORY</span><small>{historyLoading ? "READING REPOSITORY…" : `${historyCommitCount} COMMITS · ALL REFS`}</small></div>
-              <div className={styles.historyToolbar}><span>BRANCHES, MERGES, TAGS &amp; REMOTES</span><button disabled={!state.worktree || historyLoading} onClick={() => refreshHistory(0).catch((error) => setNotice(error.message))}>{historyLoading ? "REFRESHING…" : "REFRESH HISTORY"}</button></div>
-              <HistoryGraph lines={historyLines} hasMore={historyHasMore} loading={historyLoading} onLoadMore={() => refreshHistory(historyLines.filter((line) => line.kind === "commit").length, true).catch((error) => setNotice(error.message))}/>
-            </section>
-
-            <section className={styles.panel}>
-              <div className={styles.panelHead}><span>AUTONOMOUS WORK</span><small>PI SESSION · NO GIT WRITES</small></div>
-              <div className={styles.actionGrid}>{AGENT_STEPS.map((step) => <button key={step} disabled={!state.worktree || !!busy} onClick={() => runPiAction(step)}><span>{step}</span><small>{step === "PR review" ? "approval-gated" : "launch agent"}</small></button>)}</div>
+              <div className={styles.panelHead}><span>GIT HISTORY</span><div className={styles.historyHeadingActions}><small>{historyLoading ? "READING REPOSITORY…" : `${historyCommitCount} COMMITS · ALL REFS`}</small><button type="button" aria-expanded={!historyCollapsed} aria-controls="sprintpilot-git-history" onClick={() => setHistoryCollapsed((collapsed) => !collapsed)}>{historyCollapsed ? "EXPAND" : "COLLAPSE"}</button></div></div>
+              {!historyCollapsed && <div id="sprintpilot-git-history"><div className={styles.historyToolbar}><span>BRANCHES, MERGES, TAGS &amp; REMOTES</span><button disabled={!state.worktree || historyLoading} onClick={() => refreshHistory(0).catch((error) => setNotice(error.message))}>{historyLoading ? "REFRESHING…" : "REFRESH HISTORY"}</button></div><HistoryGraph lines={historyLines} hasMore={historyHasMore} loading={historyLoading} onLoadMore={() => refreshHistory(historyLines.filter((line) => line.kind === "commit").length, true).catch((error) => setNotice(error.message))}/></div>}
             </section>
 
             <section className={styles.panel}>
@@ -1071,22 +1147,33 @@ export function SprintPilot() {
     </div>
     {restartStep && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setRestartStep(null); }}>
       <section className={styles.modal} role="alertdialog" aria-modal="true" aria-labelledby="restart-step-title">
-        <span className={styles.modalKicker}>COMPLETED STEP</span>
-        <h2 id="restart-step-title">Start a new {restartStep} session?</h2>
-        <p>{restartStep} is already marked complete for {task?.key}. Starting again creates a separate Pi session and keeps the step completed.</p>
-        {!state.worktree && <p className={styles.authError}>Create the task worktree before starting a Pi session.</p>}
-        <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setRestartStep(null)}>CANCEL</button><button className={styles.primary} disabled={!state.worktree || !state.provider || !state.modelId || !!busy} onClick={restartCompletedStep}>START NEW SESSION</button></div>
+        <span className={styles.modalKicker}>REPEAT WORKFLOW STEP</span>
+        <h2 id="restart-step-title">Queue {restartStep} in the task chat?</h2>
+        <p>{restartStep} is already marked complete for {task?.key}. It will run after the current task-agent work finishes, without creating another session.</p>
+        {!state.worktree && <p className={styles.authError}>Create the task worktree before queuing work for the agent.</p>}
+        <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setRestartStep(null)}>CANCEL</button><button className={styles.primary} disabled={!state.worktree || !state.provider || !state.modelId || !!busy} onClick={restartCompletedStep}>{busy === restartStep ? "QUEUING…" : "QUEUE STEP"}</button></div>
       </section>
     </div>}
     {commitSetup && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setCommitSetup(null); }}>
       <section className={`${styles.modal} ${styles.commitModal}`} role="dialog" aria-modal="true" aria-labelledby="commit-message-title">
         <span className={styles.modalKicker}>APPROVED SNAPSHOT</span>
         <h2 id="commit-message-title">Review commit message</h2>
-        <p>The draft was generated from the exact files you approved. Edit it before committing if needed.</p>
-        {commitSetup.phase === "loading" && <p className={styles.commitScan}>● SCANNING APPROVED CODE…</p>}
+        <p>The task agent used the exact approved snapshot and Jira details to explain the change. Edit it before committing if needed.</p>
+        {commitSetup.phase === "loading" && <p className={styles.commitScan}>● DRAFTING FROM APPROVED CODE…</p>}
         {commitSetup.phase === "error" && <p className={styles.authError}>{commitSetup.error}</p>}
         {commitSetup.phase === "ready" && <label>SUBJECT &amp; BODY<textarea autoFocus value={commitSetup.message} onChange={(event) => setCommitSetup({ ...commitSetup, message: event.target.value })}/></label>}
         <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setCommitSetup(null)}>CANCEL</button><button className={styles.primary} disabled={commitSetup.phase !== "ready" || !commitSetup.message.trim() || !!busy} onClick={() => gitAction("commit", { message: commitSetup.message })}>{busy === "commit" ? "COMMITTING…" : "COMMIT APPROVED FILES"}</button></div>
+      </section>
+    </div>}
+    {pullRequestSetup && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setPullRequestSetup(null); }}>
+      <section className={`${styles.modal} ${styles.commitModal}`} role="dialog" aria-modal="true" aria-labelledby="pr-metadata-title">
+        <span className={styles.modalKicker}>AGENT-GENERATED PR METADATA</span>
+        <h2 id="pr-metadata-title">Review pull request details</h2>
+        <p>The task agent read the current diff and drafted this metadata. The repository title format is enforced before the PR is created.</p>
+        {pullRequestSetup.phase === "loading" && <p className={styles.commitScan}>● DRAFTING FROM CURRENT CHANGES…</p>}
+        {pullRequestSetup.phase === "error" && <p className={styles.authError}>{pullRequestSetup.error}</p>}
+        {pullRequestSetup.phase === "ready" && <><label>PR TITLE<input autoFocus value={pullRequestSetup.title} onChange={(event) => setPullRequestSetup({ ...pullRequestSetup, title: event.target.value })}/></label><label>DESCRIPTION<textarea value={pullRequestSetup.description} onChange={(event) => setPullRequestSetup({ ...pullRequestSetup, description: event.target.value })}/></label></>}
+        <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setPullRequestSetup(null)}>CANCEL</button><button className={styles.primary} disabled={pullRequestSetup.phase !== "ready" || !pullRequestSetup.title.trim() || !pullRequestSetup.description.trim() || !!busy} onClick={async () => { if (await gitAction("pr", { draft: pullRequestSetup.draft, title: pullRequestSetup.title, description: pullRequestSetup.description })) setPullRequestSetup(null); }}>{busy === "pr" ? "OPENING…" : pullRequestSetup.draft ? "OPEN DRAFT PR" : "OPEN READY PR"}</button></div>
       </section>
     </div>}
     {deleteTarget && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setDeleteTarget(null); }}>

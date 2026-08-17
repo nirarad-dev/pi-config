@@ -243,6 +243,16 @@ export function AppShell() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!embedded || !sessionScopeCwd || !selectedSession?.id || selectedSession.cwd !== sessionScopeCwd) return;
+    window.parent.postMessage({
+      source: "pi-web",
+      type: "session-selected",
+      sessionId: selectedSession.id,
+      cwd: sessionScopeCwd,
+    }, window.location.origin);
+  }, [embedded, selectedSession?.cwd, selectedSession?.id, sessionScopeCwd]);
+
   // Context usage — populated by ChatWindow, displayed in top bar
   const [contextUsage, setContextUsage] = useState<{ percent: number | null; contextWindow: number; tokens: number | null } | null>(null);
   const handleContextUsageChange = useCallback((usage: { percent: number | null; contextWindow: number; tokens: number | null } | null) => {
