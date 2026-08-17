@@ -7,6 +7,7 @@ import { completedStepsForJiraStatus, normalizeCompletedSteps, sortSprintTasks, 
 import { sprintPilotWorkflowPrompt } from "@/lib/sprintpilot-workflow-prompts";
 import { buildSprintPilotChangeTree, type SprintPilotChangeTreeNode } from "@/lib/sprintpilot-change-tree";
 import { parseDiff } from "@/lib/sprintpilot-diff";
+import { annotateDiffLines, isWhitespaceOnlyHunk, type AnnotatedDiffLine } from "@/lib/sprintpilot-diff-intraline";
 import type { SprintPilotHistoryLine } from "@/lib/sprintpilot-git-history";
 import { sprintPilotDiffTokenStyles } from "@/lib/sprintpilot-highlight";
 import { buildReviewFixPrompt, type ReviewComment } from "@/lib/sprintpilot-review";
@@ -249,9 +250,29 @@ function HighlightedDiffCode({ text, language }: { text: string; language?: stri
     PreTag="code"
     CodeTag="span"
     className={styles.diffSyntax}
-    customStyle={{ margin: 0, padding: "0 14px 0 8px", overflow: "visible", background: "transparent", font: "inherit", whiteSpace: "pre" }}
+    customStyle={{ margin: 0, padding: 0, overflow: "visible", background: "transparent", font: "inherit", whiteSpace: "pre" }}
     codeTagProps={{ style: { font: "inherit", whiteSpace: "inherit" } }}
   >{text || " "}</SyntaxHighlighter>;
+}
+
+/**
+ * Word-level backgrounds, painted behind the syntax-highlighted text.
+ *
+ * The highlighter owns the markup of the line, so segment backgrounds cannot be
+ * injected into it without breaking tokenization across the boundaries. Instead
+ * an identical copy of the line sits underneath with transparent glyphs, which
+ * keeps the two layers in step character for character because the font and box
+ * are the same.
+ */
+function ChangeUnderlay({ line }: { line: AnnotatedDiffLine }) {
+  if (line.kind === "context" || !line.segments.some((segment) => segment.changed)) return null;
+  const tone = line.kind === "added" ? styles.wordAdded : styles.wordRemoved;
+  const muted = line.whitespaceOnly ? styles.wordWhitespace : "";
+  return <span className={styles.changeUnderlay} aria-hidden="true">{line.segments.map((segment, index) =>
+    segment.changed
+      ? <mark className={`${tone} ${muted}`} key={index}>{segment.text}</mark>
+      : <span key={index}>{segment.text}</span>
+  )}</span>;
 }
 
 function DiffEditor({
@@ -284,15 +305,15 @@ function DiffEditor({
   return <div className={styles.diffEditor}>
     <div className={styles.editorTab}><span className={styles.fileGlyph}>{name.split(".").pop()?.slice(0, 2).toUpperCase() || "F"}</span><b>{name}</b><small>{directory}</small><em>{language ? `${language.toUpperCase()} · ` : ""}READ ONLY</em></div>
     <div className={styles.editorCode}>{hunks.map((hunk, hunkIndex) => <section className={styles.diffHunk} key={`${hunk.label}-${hunkIndex}`}>
-      <div className={styles.hunkHeader}><span>⋯</span>{hunk.label}</div>
-      {hunk.lines.map((line, lineIndex) => {
+      <div className={styles.hunkHeader}><span>⋯</span>{hunk.label}{isWhitespaceOnlyHunk(annotateDiffLines(hunk.lines)) && <em className={styles.hunkWhitespaceTag}>WHITESPACE ONLY</em>}</div>
+      {annotateDiffLines(hunk.lines).map((line, lineIndex) => {
         const side = line.kind === "removed" ? "old" : "new";
         const lineNumber = side === "old" ? line.oldLine : line.newLine;
         if (lineNumber === undefined) return null;
         const lineComments = comments.filter((comment) => comment.line === lineNumber && comment.side === side);
         const isCommenting = commentingOn?.line === lineNumber && commentingOn.side === side;
         return <div className={styles.diffLineGroup} key={`${hunkIndex}-${lineIndex}`}>
-          <div className={`${styles.codeLine} ${styles[`line_${line.kind}`]}`}>
+          <div className={`${styles.codeLine} ${styles[`line_${line.kind}`]} ${line.whitespaceOnly ? styles.lineWhitespaceOnly : ""}`}>
             <button
               className={`${styles.commentPin} ${lineComments.length ? styles.commentPinActive : ""}`}
               type="button"
@@ -303,7 +324,7 @@ function DiffEditor({
                 setCommentBody("");
               }}
             >{lineComments.length || "+"}</button>
-            <span className={styles.oldLine}>{line.oldLine ?? ""}</span><span className={styles.newLine}>{line.newLine ?? ""}</span><span className={styles.changeMark}>{line.kind === "added" ? "+" : line.kind === "removed" ? "−" : ""}</span><HighlightedDiffCode text={line.content} language={language}/>
+            <span className={styles.oldLine}>{line.oldLine ?? ""}</span><span className={styles.newLine}>{line.newLine ?? ""}</span><span className={styles.changeMark}>{line.kind === "added" ? "+" : line.kind === "removed" ? "−" : ""}</span><span className={styles.codeCell}><ChangeUnderlay line={line}/><HighlightedDiffCode text={line.content} language={language}/></span>
           </div>
           {lineComments.map((comment) => <div className={`${styles.reviewComment} ${comment.sentAt ? styles.reviewCommentSent : ""}`} key={comment.id}>
             <span>{comment.sentAt ? "SENT TO AGENT" : "REVIEW NOTE"}</span><p>{comment.body}</p><button type="button" onClick={() => onDeleteComment(comment.id)} aria-label={`Delete comment on line ${lineNumber}`}>×</button>

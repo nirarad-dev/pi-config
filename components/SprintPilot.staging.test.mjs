@@ -47,3 +47,35 @@ test("committing everything clears the awaiting-you signal", () => {
   assert.match(source, /pending\.changed === 0 && \(previous\[key\]\?\.changed \|\| 0\) > 0/);
   assert.match(source, /clearAgentAlert\(key\)/);
 });
+
+test("the diff paints word-level detail under the highlighted text", () => {
+  // The highlighter owns the line's markup, so segment backgrounds go on a
+  // character-identical layer beneath it rather than inside it.
+  assert.match(source, /function ChangeUnderlay/);
+  assert.match(source, /annotateDiffLines\(hunk\.lines\)/);
+  assert.match(source, /styles\.codeCell/);
+  assert.match(css, /\.changeUnderlay\{position:absolute/);
+  assert.match(css, /color:transparent/);
+});
+
+test("both layers share one padding box so the two stay aligned", () => {
+  // The highlighter's inline padding was moved to the wrapper; leaving it in
+  // place would offset every background by 8px.
+  assert.match(source, /customStyle=\{\{ margin: 0, padding: 0,/);
+  assert.match(css, /\.codeCell\{position:relative;display:block;min-width:0;padding:0 14px 0 8px\}/);
+  assert.match(css, /\.changeUnderlay\{[^}]*padding:0 14px 0 8px/);
+});
+
+test("word backgrounds are darker than the line they sit on", () => {
+  const alpha = (rule) => Number(css.match(rule)[1]);
+  assert.ok(alpha(/\.wordAdded\{background:rgba\(46,160,67,\.(\d+)\)/) > alpha(/\.line_added\{background:rgba\(46,160,67,\.(\d+)\)/));
+  assert.ok(alpha(/\.wordRemoved\{background:rgba\(218,54,51,\.(\d+)\)/) > alpha(/\.line_removed\{background:rgba\(218,54,51,\.(\d+)\)/));
+});
+
+test("a whitespace-only change is muted rather than coloured like a real edit", () => {
+  assert.match(source, /line\.whitespaceOnly \? styles\.lineWhitespaceOnly : ""/);
+  assert.match(source, /line\.whitespaceOnly \? styles\.wordWhitespace : ""/);
+  assert.match(css, /\.lineWhitespaceOnly\.line_added\{background:rgba\(46,160,67,\.05\)\}/);
+  assert.match(css, /\.wordWhitespace\{background:rgba\(125,131,140/);
+  assert.match(source, /isWhitespaceOnlyHunk/);
+});
