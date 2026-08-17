@@ -145,32 +145,48 @@
 
 @media(max-width:1100px){.changeLayout{grid-template-columns:1fr}}
 
-/* Diff colouring, Cursor Dark.
-   Opaque rather than alpha-blended: the editor ground is a known #141414, so
-   stating the final colour directly gives the exact tone in the reference and
-   avoids a word background stacking on top of a line background to a shade
-   neither was chosen to produce.
-   Two tiers per side: the line background says "this line is part of the
-   change", the darker word background says "these characters actually differ".
+/* Diff colouring, Cursor Dark — three shades per side.
+   The two mid tones are sampled from Cursor itself (#364b3c and #4c5f52); the
+   faintest is the same hue carried most of the way back to the editor ground.
+   Reading darkest to lightest:
+     1. formatting  — the code moved but did not change (reindent, rewrap)
+     2. line        — this line is part of the change
+     3. word        — these characters are what actually differ
+   The reds are the exact mirror of the greens, red and green channels swapped,
+   so both sides step by the same amount and neither dominates the other.
+   Opaque rather than alpha-blended: the ground is a known #141414, so naming
+   the final tone gives exactly the sampled colour and stops a word background
+   from stacking onto a line background to a third, unchosen shade.
    Line text colour is deliberately not set — tinting it would fight the syntax
    highlighting that survives on top of these backgrounds. */
-.editorCode{background:#141414;color:#d8dee9}
+.editorCode{
+  background:#141414;
+  color:#d8dee9;
+  --diff-add-formatting:#233026;
+  --diff-add-line:#364b3c;
+  --diff-add-word:#4c5f52;
+  --diff-del-formatting:#302326;
+  --diff-del-line:#4b363c;
+  --diff-del-word:#5f4c52;
+}
 /* Backgrounds span the full scroll width so consecutive changed lines read as
    one band instead of a stack of boxes with dark gaps between them. */
 .codeLine{min-width:max-content;width:100%}
-.line_added{background:#1b3626}
-.line_removed{background:#3a2630}
+.line_added{background:var(--diff-add-line)}
+.line_removed{background:var(--diff-del-line)}
 .codeCell{position:relative;display:block;min-width:0;padding:0 14px 0 8px}
 .changeUnderlay{position:absolute;top:0;left:0;right:0;bottom:0;padding:0 14px 0 8px;white-space:pre;color:transparent;pointer-events:none;overflow:hidden}
 .changeUnderlay mark{background:transparent;color:transparent;border-radius:2px}
-.wordAdded{background:#2d5a3d!important}
-.wordRemoved{background:#5c3141!important}
-/* Formatting-only borrows the palette's greys, the tones it already uses for
-   present-but-not-the-point text. Covers a reindent and a rewrap alike — in
-   both the code moved, not changed. */
-.lineFormattingOnly.line_added{background:#202020}
-.lineFormattingOnly.line_removed{background:#202020}
-.wordFormatting{background:#333333!important;border-bottom:1px dotted rgba(216,222,233,.30)}
+.wordAdded{background:var(--diff-add-word)!important}
+.wordRemoved{background:var(--diff-del-word)!important}
+/* Formatting-only keeps the side's hue at the faintest step, so a reflow still
+   reads as an addition or a removal while staying clearly behind real edits.
+   The dotted rule is what separates it from a quiet real change. */
+.lineFormattingOnly.line_added{background:var(--diff-add-formatting)}
+.lineFormattingOnly.line_removed{background:var(--diff-del-formatting)}
+.lineFormattingOnly .wordAdded{background:var(--diff-add-line)!important}
+.lineFormattingOnly .wordRemoved{background:var(--diff-del-line)!important}
+.wordFormatting{border-bottom:1px dotted rgba(216,222,233,.30)}
 .lineFormattingOnly .changeMark{color:#6f6f6f;background:transparent}
 .hunkFormattingTag{margin-left:10px;font-style:normal;font-size:8px;font-weight:800;letter-spacing:.12em;color:#6f6f6f;border:1px solid #2a2a2a;padding:2px 6px}
 .line_added .changeMark{color:#a3be8c;background:transparent}

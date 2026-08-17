@@ -68,11 +68,12 @@ test("both layers share one padding box so the two stay aligned", () => {
 
 test("the diff derives its add and remove colours from the Cursor Dark palette", () => {
   // The published theme has no diff mapping, so these are its own green and red.
-  assert.match(css, /\.line_added\{background:#1b3626\}/);
-  assert.match(css, /\.line_removed\{background:#3a2630\}/);
+  // The two mid tones are sampled from Cursor itself.
+  assert.match(css, /--diff-add-line:#364b3c/);
+  assert.match(css, /--diff-add-word:#4c5f52/);
   // Consecutive changed lines must read as one band, not a stack of boxes.
   assert.match(css, /\.codeLine\{min-width:max-content;width:100%\}/);
-  assert.match(css, /\.editorCode\{background:#141414/);
+  assert.match(css, /\.editorCode\{\s*background:#141414/);
   // Line text colour stays untinted so syntax highlighting reads normally.
   assert.doesNotMatch(css, /\.line_added\{background:[^}]*;color:/);
   assert.doesNotMatch(css, /\.line_removed\{background:[^}]*;color:/);
@@ -87,11 +88,25 @@ test("the syntax palette is Cursor Dark, including the added Python categories",
   assert.doesNotMatch(theme, /fontFamily|lineHeight|textShadow/);
 });
 
-test("word backgrounds stay clearly lighter than the line they sit on", () => {
-  const luma = (rule) => { const [, r, g, b] = css.match(rule).map((v, i) => i ? parseInt(v, 16) : v); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
-  const hexRule = (name) => new RegExp(`\\.${name}\\{background:#(\\w\\w)(\\w\\w)(\\w\\w)`);
-  assert.ok(luma(hexRule("wordAdded")) - luma(hexRule("line_added")) > 15, "added tiers too close");
-  assert.ok(luma(hexRule("wordRemoved")) - luma(hexRule("line_removed")) > 15, "removed tiers too close");
+const tone = (css, name) => {
+  const [, r, g, b] = css.match(new RegExp(`--${name}:#(\\w\\w)(\\w\\w)(\\w\\w)`)).map((v, i) => i ? parseInt(v, 16) : v);
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+};
+
+test("each side steps through three distinct shades, darkest to lightest", () => {
+  for (const side of ["add", "del"]) {
+    const formatting = tone(css, `diff-${side}-formatting`);
+    const line = tone(css, `diff-${side}-line`);
+    const word = tone(css, `diff-${side}-word`);
+    assert.ok(line - formatting > 15, `${side}: formatting and line too close`);
+    assert.ok(word - line > 15, `${side}: line and word too close`);
+  }
+});
+
+test("the red tiers mirror the green ones so neither side dominates", () => {
+  for (const step of ["formatting", "line", "word"]) {
+    assert.ok(Math.abs(tone(css, `diff-add-${step}`) - tone(css, `diff-del-${step}`)) < 12, `${step} steps are unbalanced`);
+  }
 });
 
 test("a wholly changed line draws no word box, so insertions form one band", () => {
@@ -102,7 +117,7 @@ test("a formatting-only change is muted rather than coloured like a real edit", 
   // Covers a reindent and a rewrap alike: in both the code moved, not changed.
   assert.match(source, /line\.formattingOnly \? styles\.lineFormattingOnly : ""/);
   assert.match(source, /line\.formattingOnly \? styles\.wordFormatting : ""/);
-  assert.match(css, /\.lineFormattingOnly\.line_added\{background:#202020\}/);
-  assert.match(css, /\.wordFormatting\{background:#333333/);
+  assert.match(css, /\.lineFormattingOnly\.line_added\{background:var\(--diff-add-formatting\)\}/);
+  assert.match(css, /\.wordFormatting\{border-bottom:1px dotted/);
   assert.match(source, /isFormattingOnlyHunk/);
 });
