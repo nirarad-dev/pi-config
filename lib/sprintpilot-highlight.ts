@@ -3,9 +3,9 @@ import { refractor } from "refractor/all";
 /**
  * Cursor Dark colours for the Python categories the stock Prism grammar does
  * not recognize, added below. They follow the same role mapping as the base
- * theme — yellow for types, purple for constants and `self`, cyan for callables
- * and namespaces, blue for decorators — so the extra categories are
- * indistinguishable from the theme's own tokens.
+ * theme — cyan for types, callables, and namespaces; purple for constants,
+ * `self`, and decorators — so the extra categories are indistinguishable from
+ * the theme's own tokens.
  *
  * The hex values are literals rather than an import of CURSOR_DARK: this module
  * is loaded directly by its unit test under node's type-stripping loader, which
@@ -13,23 +13,23 @@ import { refractor } from "refractor/all";
  * test asserts the two files agree, so a change to the palette cannot drift.
  */
 export const sprintPilotDiffTokenStyles = {
-  "class-reference": { color: "#ebcb8b" },
-  "class-reference.class-name": { color: "#ebcb8b" },
-  "python-constant": { color: "#b48ead" },
-  "python-constant.constant": { color: "#b48ead" },
+  "class-reference": { color: "#88c0d0" },
+  "class-reference.class-name": { color: "#88c0d0" },
+  "python-constant": { color: "#a7a0f4" },
+  "python-constant.constant": { color: "#a7a0f4" },
   "function-call": { color: "#88c0d0" },
   "function-call.function": { color: "#88c0d0" },
   "import-name": { color: "#88c0d0" },
   "import-name.namespace": { color: "#88c0d0" },
-  "property-access": { color: "#d8dee9" },
-  "property-access.property": { color: "#d8dee9" },
-  "self-reference": { color: "#b48ead" },
-  "self-reference.variable": { color: "#b48ead" },
+  "property-access": { color: "#d6d6dd" },
+  "property-access.property": { color: "#d6d6dd" },
+  "self-reference": { color: "#a7a0f4" },
+  "self-reference.variable": { color: "#a7a0f4" },
   "special-name": { color: "#88c0d0" },
   "special-name.function": { color: "#88c0d0" },
-  decorator: { color: "#81a1c1" },
-  annotation: { color: "#81a1c1" },
-  "decorator.annotation.punctuation": { color: "#81a1c1" },
+  decorator: { color: "#a7a0f4" },
+  annotation: { color: "#a7a0f4" },
+  "decorator.annotation.punctuation": { color: "#a7a0f4" },
 };
 
 export function configureSprintPilotPythonHighlighting(): void {
