@@ -4,20 +4,33 @@ import type { DiffLine } from "./sprintpilot-diff";
  * Word-level detail for the diff viewer.
  *
  * A line-level background alone says "something on this line changed" and
- * nothing more, so a reformatted line and a rewritten one look identical. This
- * pairs each removed line with the added line that replaced it, marks the words
- * that actually differ, and flags the pairs whose only difference is
- * whitespace — which is what lets the viewer render reformatting quietly and
- * real edits loudly.
+ * nothing more, so a reformatted line and a rewritten one look identical.
+ *
+ * The comparison runs across a whole replacement — every removed line against
+ * every added line — rather than pairing them positionally. Positional pairing
+ * cannot see a reflow: when one line is split into three, it compares the
+ * original against the first fragment and calls the rest brand new, burying the
+ * one argument that genuinely changed under a wall of colour. Diffing the runs
+ * as one token stream makes a moved line break just another token, so what
+ * survives as "changed" is the code that actually changed.
  */
 
 export type DiffSegment = { text: string; changed: boolean };
 
 export type AnnotatedDiffLine = DiffLine & {
   segments: DiffSegment[];
-  /** The paired lines are identical once whitespace is ignored. */
-  whitespaceOnly: boolean;
+  /**
+   * The line's only differences are whitespace or a moved line break — a
+   * reindent, a rewrap, a reformat. No code was added or removed on it.
+   */
+  formattingOnly: boolean;
 };
+
+/** Stands in for a line break inside a run's token stream. */
+const NEWLINE = "\n";
+
+/** Beyond this the quadratic table is not worth building; see annotateDiffLines. */
+const MAX_LCS_CELLS = 400_000;
 
 /**
  * Split into words, punctuation, and whitespace runs, keeping every character.
@@ -25,62 +38,135 @@ export type AnnotatedDiffLine = DiffLine & {
  * difference the comparison can see.
  */
 export function tokenizeDiffLine(text: string): string[] {
-  return text.match(/\s+|[A-Za-z0-9_$]+|[^\sA-Za-z0-9_$]/g) || [];
+  return text.match(/[^\S\n]+|[A-Za-z0-9_$]+|[^\s A-Za-z0-9_$]/g) || [];
 }
 
-function joinTokens(tokens: string[]): string {
-  return tokens.join("");
+function tokenizeRun(lines: string[]): string[] {
+  return lines.flatMap((line, index) => index === 0 ? tokenizeDiffLine(line) : [NEWLINE, ...tokenizeDiffLine(line)]);
+}
+
+function isInvisible(token: string): boolean {
+  return token === NEWLINE || /^\s+$/.test(token);
+}
+
+type Op = { token: string; side: "common" | "removed" | "added" };
+
+/**
+ * Longest common subsequence over tokens, returned as an edit script.
+ *
+ * Prefix and suffix are trimmed first: a replacement usually shares long
+ * unchanged head and tail regions, and removing them keeps the table small
+ * enough that the quadratic step only ever runs over the part that differs.
+ */
+export function diffTokens(before: string[], after: string[]): Op[] {
+  let prefix = 0;
+  while (prefix < before.length && prefix < after.length && before[prefix] === after[prefix]) prefix++;
+  let suffix = 0;
+  while (
+    suffix < before.length - prefix
+    && suffix < after.length - prefix
+    && before[before.length - 1 - suffix] === after[after.length - 1 - suffix]
+  ) suffix++;
+
+  const head = before.slice(0, prefix).map((token): Op => ({ token, side: "common" }));
+  const tail = before.slice(before.length - suffix).map((token): Op => ({ token, side: "common" }));
+  const midBefore = before.slice(prefix, before.length - suffix);
+  const midAfter = after.slice(prefix, after.length - suffix);
+
+  if (!midBefore.length && !midAfter.length) return [...head, ...tail];
+  if (!midBefore.length) return [...head, ...midAfter.map((token): Op => ({ token, side: "added" })), ...tail];
+  if (!midAfter.length) return [...head, ...midBefore.map((token): Op => ({ token, side: "removed" })), ...tail];
+
+  if (midBefore.length * midAfter.length > MAX_LCS_CELLS) {
+    return [
+      ...head,
+      ...midBefore.map((token): Op => ({ token, side: "removed" })),
+      ...midAfter.map((token): Op => ({ token, side: "added" })),
+      ...tail,
+    ];
+  }
+
+  const rows = midBefore.length;
+  const columns = midAfter.length;
+  const table: number[][] = Array.from({ length: rows + 1 }, () => new Array<number>(columns + 1).fill(0));
+  for (let row = rows - 1; row >= 0; row--) {
+    for (let column = columns - 1; column >= 0; column--) {
+      table[row][column] = midBefore[row] === midAfter[column]
+        ? table[row + 1][column + 1] + 1
+        : Math.max(table[row + 1][column], table[row][column + 1]);
+    }
+  }
+
+  const middle: Op[] = [];
+  let row = 0;
+  let column = 0;
+  while (row < rows && column < columns) {
+    if (midBefore[row] === midAfter[column]) {
+      middle.push({ token: midBefore[row], side: "common" });
+      row++;
+      column++;
+    } else if (table[row + 1][column] >= table[row][column + 1]) {
+      middle.push({ token: midBefore[row++], side: "removed" });
+    } else {
+      middle.push({ token: midAfter[column++], side: "added" });
+    }
+  }
+  while (row < rows) middle.push({ token: midBefore[row++], side: "removed" });
+  while (column < columns) middle.push({ token: midAfter[column++], side: "added" });
+
+  return [...head, ...middle, ...tail];
 }
 
 /**
- * Mark the differing middle of two token lists.
+ * Rebuild one side of a run into per-line segments.
  *
- * Trimming the common prefix and suffix is what diff viewers use for
- * intra-line detail: it is linear, stable, and for the edits people actually
- * make to one line it selects the same span a full LCS would, without the
- * scattered single-character highlights an LCS produces on dissimilar lines.
+ * Filtering the edit script to the ops that side actually contains reproduces
+ * its original text exactly, so splitting on the newline tokens gives the
+ * original lines back. A changed newline is the reflow itself: it delimits but
+ * never renders, since a highlight on an invisible character would just be a
+ * stray block of colour at the end of a line.
  */
-export function segmentPair(before: string, after: string): { before: DiffSegment[]; after: DiffSegment[] } {
-  const beforeTokens = tokenizeDiffLine(before);
-  const afterTokens = tokenizeDiffLine(after);
+function rebuildSide(ops: Op[], side: "removed" | "added"): { segments: DiffSegment[]; formattingOnly: boolean }[] {
+  const lines: { segments: DiffSegment[]; formattingOnly: boolean }[] = [];
+  let segments: DiffSegment[] = [];
+  let realChange = false;
+  let anyChange = false;
 
-  let prefix = 0;
-  while (prefix < beforeTokens.length && prefix < afterTokens.length && beforeTokens[prefix] === afterTokens[prefix]) {
-    prefix++;
-  }
-  let suffix = 0;
-  while (
-    suffix < beforeTokens.length - prefix
-    && suffix < afterTokens.length - prefix
-    && beforeTokens[beforeTokens.length - 1 - suffix] === afterTokens[afterTokens.length - 1 - suffix]
-  ) {
-    suffix++;
-  }
-
-  const build = (tokens: string[]): DiffSegment[] => {
-    const head = joinTokens(tokens.slice(0, prefix));
-    const middle = joinTokens(tokens.slice(prefix, tokens.length - suffix));
-    const tail = joinTokens(tokens.slice(tokens.length - suffix));
-    return [
-      ...(head ? [{ text: head, changed: false }] : []),
-      ...(middle ? [{ text: middle, changed: true }] : []),
-      ...(tail ? [{ text: tail, changed: false }] : []),
-    ];
+  const pushSegment = (text: string, changed: boolean) => {
+    const last = segments[segments.length - 1];
+    if (last && last.changed === changed) last.text += text;
+    else segments.push({ text, changed });
   };
-  return { before: build(beforeTokens), after: build(afterTokens) };
-}
+  const endLine = () => {
+    lines.push({ segments, formattingOnly: anyChange && !realChange });
+    segments = [];
+    realChange = false;
+    anyChange = false;
+  };
 
-/** True when two lines differ only in whitespace — indentation, tabs, trailing space. */
-export function isWhitespaceOnlyChange(before: string, after: string): boolean {
-  if (before === after) return false;
-  return before.replace(/\s+/g, "") === after.replace(/\s+/g, "");
+  for (const op of ops) {
+    if (op.side !== "common" && op.side !== side) continue;
+    const changed = op.side !== "common";
+    if (op.token === NEWLINE) {
+      if (changed) anyChange = true;
+      endLine();
+      continue;
+    }
+    pushSegment(op.token, changed);
+    if (changed) {
+      anyChange = true;
+      if (!isInvisible(op.token)) realChange = true;
+    }
+  }
+  endLine();
+  return lines;
 }
 
 function wholeLine(line: DiffLine): AnnotatedDiffLine {
   return {
     ...line,
     segments: line.content ? [{ text: line.content, changed: line.kind !== "context" }] : [],
-    whitespaceOnly: false,
+    formattingOnly: false,
   };
 }
 
@@ -88,8 +174,8 @@ function wholeLine(line: DiffLine): AnnotatedDiffLine {
  * Annotate a hunk's lines.
  *
  * Git emits a replacement as a run of removed lines followed by a run of added
- * lines, so the nth removal pairs with the nth addition. Lines beyond the
- * shorter run are a genuine insertion or deletion and stay fully marked.
+ * lines. Those two runs are compared as a whole, which is what lets a line
+ * break move without being mistaken for a code change.
  */
 export function annotateDiffLines(lines: DiffLine[]): AnnotatedDiffLine[] {
   const annotated: AnnotatedDiffLine[] = [];
@@ -107,27 +193,35 @@ export function annotateDiffLines(lines: DiffLine[]): AnnotatedDiffLine[] {
     const added: DiffLine[] = [];
     while (index < lines.length && lines[index].kind === "added") added.push(lines[index++]);
 
-    const paired = Math.min(removed.length, added.length);
-    const removedOut: AnnotatedDiffLine[] = [];
-    const addedOut: AnnotatedDiffLine[] = [];
-    for (let position = 0; position < paired; position++) {
-      const before = removed[position].content;
-      const after = added[position].content;
-      const segments = segmentPair(before, after);
-      const whitespaceOnly = isWhitespaceOnlyChange(before, after);
-      removedOut.push({ ...removed[position], segments: segments.before, whitespaceOnly });
-      addedOut.push({ ...added[position], segments: segments.after, whitespaceOnly });
+    if (!added.length) {
+      annotated.push(...removed.map(wholeLine));
+      continue;
     }
-    for (let position = paired; position < removed.length; position++) removedOut.push(wholeLine(removed[position]));
-    for (let position = paired; position < added.length; position++) addedOut.push(wholeLine(added[position]));
-    annotated.push(...removedOut, ...addedOut);
+
+    const ops = diffTokens(tokenizeRun(removed.map((line) => line.content)), tokenizeRun(added.map((line) => line.content)));
+    const removedDetail = rebuildSide(ops, "removed");
+    const addedDetail = rebuildSide(ops, "added");
+    // Formatting is a property of the replacement, not of one side. A rewrap
+    // often leaves one side with no changed tokens at all — the text it holds
+    // survived verbatim — and that side must still read as formatting rather
+    // than as an ordinary edit, or half a reflow would light up.
+    const runIsFormatting = !ops.some((op) => op.side !== "common" && !isInvisible(op.token));
+    const merge = (line: DiffLine, detail: { segments: DiffSegment[]; formattingOnly: boolean } | undefined) => ({
+      ...line,
+      ...(detail || wholeLine(line)),
+      formattingOnly: runIsFormatting || (detail?.formattingOnly ?? false),
+    });
+    annotated.push(
+      ...removed.map((line, position) => merge(line, removedDetail[position])),
+      ...added.map((line, position) => merge(line, addedDetail[position])),
+    );
   }
 
   return annotated;
 }
 
-/** Whether every changed line in a hunk is whitespace-only, for the hunk label. */
-export function isWhitespaceOnlyHunk(lines: AnnotatedDiffLine[]): boolean {
+/** Whether every changed line in a hunk is formatting only, for the hunk label. */
+export function isFormattingOnlyHunk(lines: AnnotatedDiffLine[]): boolean {
   const changed = lines.filter((line) => line.kind !== "context");
-  return changed.length > 0 && changed.every((line) => line.whitespaceOnly);
+  return changed.length > 0 && changed.every((line) => line.formattingOnly);
 }

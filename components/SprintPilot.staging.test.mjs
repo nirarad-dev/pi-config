@@ -66,16 +66,21 @@ test("both layers share one padding box so the two stay aligned", () => {
   assert.match(css, /\.changeUnderlay\{[^}]*padding:0 14px 0 8px/);
 });
 
-test("word backgrounds are darker than the line they sit on", () => {
+test("word backgrounds stay clearly darker than the line they sit on", () => {
   const alpha = (rule) => Number(css.match(rule)[1]);
-  assert.ok(alpha(/\.wordAdded\{background:rgba\(46,160,67,\.(\d+)\)/) > alpha(/\.line_added\{background:rgba\(46,160,67,\.(\d+)\)/));
-  assert.ok(alpha(/\.wordRemoved\{background:rgba\(218,54,51,\.(\d+)\)/) > alpha(/\.line_removed\{background:rgba\(218,54,51,\.(\d+)\)/));
+  const lineAdded = alpha(/\.line_added\{background:rgba\([\d,]+,\.(\d+)\)/);
+  const wordAdded = alpha(/\.wordAdded\{background:rgba\([\d,]+,\.(\d+)\)/);
+  const lineRemoved = alpha(/\.line_removed\{background:rgba\([\d,]+,\.(\d+)\)/);
+  const wordRemoved = alpha(/\.wordRemoved\{background:rgba\([\d,]+,\.(\d+)\)/);
+  assert.ok(wordAdded >= lineAdded + 10, `added tiers too close: ${lineAdded} vs ${wordAdded}`);
+  assert.ok(wordRemoved >= lineRemoved + 10, `removed tiers too close: ${lineRemoved} vs ${wordRemoved}`);
 });
 
-test("a whitespace-only change is muted rather than coloured like a real edit", () => {
-  assert.match(source, /line\.whitespaceOnly \? styles\.lineWhitespaceOnly : ""/);
-  assert.match(source, /line\.whitespaceOnly \? styles\.wordWhitespace : ""/);
-  assert.match(css, /\.lineWhitespaceOnly\.line_added\{background:rgba\(46,160,67,\.05\)\}/);
-  assert.match(css, /\.wordWhitespace\{background:rgba\(125,131,140/);
-  assert.match(source, /isWhitespaceOnlyHunk/);
+test("a formatting-only change is muted rather than coloured like a real edit", () => {
+  // Covers a reindent and a rewrap alike: in both the code moved, not changed.
+  assert.match(source, /line\.formattingOnly \? styles\.lineFormattingOnly : ""/);
+  assert.match(source, /line\.formattingOnly \? styles\.wordFormatting : ""/);
+  assert.match(css, /\.lineFormattingOnly\.line_added\{background:rgba\([\d,]+,\.08\)\}/);
+  assert.match(css, /\.wordFormatting\{background:rgba\(125,131,140/);
+  assert.match(source, /isFormattingOnlyHunk/);
 });

@@ -147,21 +147,26 @@
 
 /* Diff colouring, two intensities per side.
    The line background says "this line is part of the change"; the darker word
-   background says "these are the characters that actually differ". A line that
-   only moved whitespace gets a muted version of both, so reformatting reads as
-   background noise instead of competing with real edits. */
-.line_added{background:rgba(46,160,67,.14);color:#cbe7d2}
-.line_removed{background:rgba(218,54,51,.13);color:#eec9c9}
+   background says "these are the characters that actually differ". Both are
+   desaturated so they sit behind the syntax colours rather than competing with
+   them, while the gap between the two tiers stays wide enough to read at a
+   glance. A line that only moved whitespace gets a muted version of both, so
+   reformatting reads as background noise instead of a real edit. */
+.line_added{background:rgba(120,175,130,.24);color:#c7cdc8}
+.line_removed{background:rgba(190,110,120,.24);color:#cfc8c9}
 .codeCell{position:relative;display:block;min-width:0;padding:0 14px 0 8px}
 .changeUnderlay{position:absolute;top:0;left:0;right:0;bottom:0;padding:0 14px 0 8px;white-space:pre;color:transparent;pointer-events:none;overflow:hidden}
 .changeUnderlay mark{background:transparent;color:transparent;border-radius:2px}
-.wordAdded{background:rgba(46,160,67,.42)!important}
-.wordRemoved{background:rgba(218,54,51,.40)!important}
+.wordAdded{background:rgba(90,180,115,.42)!important}
+.wordRemoved{background:rgba(200,105,115,.40)!important}
 /* Whitespace-only: quieter fill plus a dotted rule, so it is identifiable at a
    glance without a character-substitution trick that would break alignment
-   between the underlay and the text above it. */
-.lineWhitespaceOnly.line_added{background:rgba(46,160,67,.05)}
-.lineWhitespaceOnly.line_removed{background:rgba(218,54,51,.05)}
-.wordWhitespace{background:rgba(125,131,140,.20)!important;border-bottom:1px dotted rgba(180,186,194,.55)}
-.lineWhitespaceOnly .changeMark{color:#8d969f;background:transparent}
-.hunkWhitespaceTag{margin-left:10px;font-style:normal;font-size:8px;font-weight:800;letter-spacing:.12em;color:#8d969f;border:1px solid #35393e;padding:2px 6px}
+   between the underlay and the text above it. Covers a reindent and a rewrap
+   alike: both are the code being moved, not changed. */
+.lineFormattingOnly.line_added{background:rgba(120,175,130,.08)}
+.lineFormattingOnly.line_removed{background:rgba(190,110,120,.08)}
+.wordFormatting{background:rgba(125,131,140,.16)!important;border-bottom:1px dotted rgba(170,176,184,.45)}
+.lineFormattingOnly .changeMark{color:#8d969f;background:transparent}
+.hunkFormattingTag{margin-left:10px;font-style:normal;font-size:8px;font-weight:800;letter-spacing:.12em;color:#8d969f;border:1px solid #35393e;padding:2px 6px}
+.line_added .changeMark{color:#8cbd97;background:rgba(120,175,130,.14)}
+.line_removed .changeMark{color:#c99298;background:rgba(190,110,120,.14)}
