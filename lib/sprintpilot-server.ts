@@ -103,6 +103,30 @@ function safeRelativeFiles(files: unknown): string[] {
  *
  * Renames report both sides; either name is a legitimate thing to commit.
  */
+/**
+ * Split porcelain output into what Git has staged and what it has not.
+ *
+ * A path can legitimately appear in both: `MM` means a staged modification plus
+ * further unstaged edits on top. The review panel shows it in both columns for
+ * that reason, exactly as Git reports it.
+ */
+export function parseStagedAndUnstaged(output: string): { staged: string[]; unstaged: string[] } {
+  const staged = new Set<string>();
+  const unstaged = new Set<string>();
+  const records = output.split("\0");
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    if (!record || record.length < 4 || record[2] !== " ") continue;
+    const indexStatus = record[0];
+    const worktreeStatus = record[1];
+    const path = record.slice(3);
+    if ("RC".includes(indexStatus) || "RC".includes(worktreeStatus)) index++;
+    if (indexStatus !== " " && indexStatus !== "?") staged.add(path);
+    if (worktreeStatus !== " ") unstaged.add(path);
+  }
+  return { staged: [...staged].sort(), unstaged: [...unstaged].sort() };
+}
+
 export function parseChangedPaths(output: string): Set<string> {
   const records = output.split("\0");
   const paths = new Set<string>();
@@ -130,12 +154,22 @@ export async function changedPaths(cwd: string): Promise<Set<string>> {
   // Parsed here rather than through lib/git-status.ts because this module is
   // loaded directly by its unit test under node's type-stripping loader, which
   // cannot resolve the extensionless relative imports the rest of lib/ uses.
+  return parseChangedPaths(await rawStatus(cwd));
+}
+
+/** Raw, untrimmed porcelain output. See changedPaths for why trimming breaks it. */
+async function rawStatus(cwd: string): Promise<string> {
   const { stdout } = await execFileAsync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
     cwd,
     env: { ...process.env, LC_ALL: "C" },
     maxBuffer: MAX_BUFFER,
   });
-  return parseChangedPaths(stdout);
+  return stdout;
+}
+
+/** What Git currently has staged and unstaged in this worktree. */
+export async function stagedAndUnstaged(cwd: string): Promise<{ staged: string[]; unstaged: string[] }> {
+  return parseStagedAndUnstaged(await rawStatus(cwd));
 }
 
 export async function snapshotChanges(cwd: string, filesInput: unknown): Promise<{ files: string[]; hash: string }> {

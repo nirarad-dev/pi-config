@@ -6,7 +6,7 @@ import { checkSprintPilotPullRequestInJira } from "@/lib/sprintpilot-jira-links"
 import { appendArnacAiDisclosure, sprintPilotJiraUrl } from "@/lib/sprintpilot-pr-metadata";
 import { getRpcSession, startRpcSession } from "@/lib/rpc-manager";
 import { resolveSessionPath } from "@/lib/session-reader";
-import { assertSprintWorktree, createApproval, readApproval, releaseApproval, run, snapshotChanges } from "@/lib/sprintpilot-server";
+import { assertSprintWorktree, changedPaths, createApproval, readApproval, releaseApproval, run, snapshotChanges, stagedAndUnstaged } from "@/lib/sprintpilot-server";
 
 function jiraKeyFromBranch(branch: string) {
   return branch.match(/(?:^|\/)([A-Z][A-Z0-9]+-\d+)(?:-|$)/)?.[1];
@@ -18,17 +18,53 @@ export async function POST(request: Request) {
     const action = String(body.action || "");
     const cwd = await assertSprintWorktree(body.cwd);
 
+    if (action === "status") {
+      return NextResponse.json(await stagedAndUnstaged(cwd));
+    }
+
+    if (action === "stage" || action === "unstage") {
+      const files = Array.isArray(body.files) ? body.files.map(String) : [];
+      if (!files.length) throw new Error("Select at least one file");
+      // Only paths Git reports as changed may be staged. Without this a crafted
+      // request could name any ignored path — a local .env, a credentials file —
+      // and the force below would put it in the index.
+      const changed = await changedPaths(cwd);
+      const unknown = files.filter((file) => !changed.has(file));
+      if (unknown.length) throw new Error(`Git does not report these files as changed: ${unknown.join(", ")}`);
+
+      if (action === "unstage") {
+        await run("git", ["restore", "--staged", "--", ...files], cwd);
+        return NextResponse.json({ success: true, ...(await stagedAndUnstaged(cwd)) });
+      }
+      // A tracked file inside a directory matched by .gitignore cannot be staged
+      // without -f (arnac's root `env/` virtualenv rule catches
+      // automation/config/env this way). Forcing silently would also let a
+      // genuinely ignored file in, so the force is the operator's explicit
+      // choice: the first attempt reports back, and the retry carries `force`.
+      try {
+        await run("git", ["add", ...(body.force === true ? ["-f"] : []), "--", ...files], cwd);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/ignored by one of your \.gitignore files/i.test(message)) {
+          return NextResponse.json({
+            ignored: true,
+            files,
+            error: `${files.length === 1 ? "That path is" : "Those paths are"} matched by a .gitignore rule. Stage anyway?`,
+          }, { status: 409 });
+        }
+        throw error;
+      }
+      return NextResponse.json({ success: true, ...(await stagedAndUnstaged(cwd)) });
+    }
+
     if (action === "commit-message") {
-      const existingApproval = body.approvalToken ? readApproval(body.approvalToken) : undefined;
-      if (existingApproval && existingApproval.cwd !== cwd) throw new Error("Approval belongs to another worktree");
-      const approved = existingApproval
-        ? { files: existingApproval.files, hash: existingApproval.hash, token: String(body.approvalToken) }
-        : await (async () => {
-          const snapshot = await snapshotChanges(cwd, body.files);
-          return { ...snapshot, token: createApproval(cwd, snapshot.files, snapshot.hash) };
-        })();
-      const current = await snapshotChanges(cwd, approved.files);
-      if (current.hash !== approved.hash) throw new Error("Changes moved since approval; review and draft the commit message again");
+      // The staged set is the commit, so it is read from Git rather than taken
+      // from the request. The operator curated it with the stage/unstage
+      // controls; the client has nothing to add and cannot widen it.
+      const { staged } = await stagedAndUnstaged(cwd);
+      if (!staged.length) throw new Error("Stage at least one file before drafting a commit message");
+      const snapshot = await snapshotChanges(cwd, staged);
+      const approved = { ...snapshot, token: createApproval(cwd, snapshot.files, snapshot.hash) };
       const [patch, recentLog] = await Promise.all([
         run("git", ["diff", "--no-ext-diff", "HEAD", "--", ...approved.files], cwd),
         run("git", ["log", "-n", "10", "--no-merges", "--format=%s"], cwd).catch(() => ""),
@@ -62,18 +98,21 @@ export async function POST(request: Request) {
     if (action === "commit") {
       const approval = readApproval(body.approvalToken);
       if (approval.cwd !== cwd) throw new Error("Approval belongs to another worktree");
+      const { staged } = await stagedAndUnstaged(cwd);
+      // The index is what gets committed, so verify the index still holds
+      // exactly what was reviewed. Staging or unstaging a file after drafting
+      // the message would otherwise commit something the message never described.
+      if (staged.join("\n") !== approval.files.join("\n")) {
+        throw new Error("The staged files changed since you reviewed them; draft the commit message again to describe what is staged now");
+      }
       const current = await snapshotChanges(cwd, approval.files);
-      if (current.hash !== approval.hash) throw new Error("The selected files changed since you reviewed them; draft the commit message again to pick up the new content");
+      if (current.hash !== approval.hash) throw new Error("The staged files changed since you reviewed them; draft the commit message again to pick up the new content");
       const message = String(body.message || "").trim();
       if (!message) throw new Error("Commit message is required");
-      // `-f` is required, not a shortcut: a tracked file inside a directory
-      // matched by .gitignore (arnac has a generic `env/` virtualenv rule that
-      // also catches automation/config/env) cannot be staged without it, and a
-      // plain `git add` fails the whole commit. The force stays narrow because
-      // `snapshotChanges` already rejected any approved path Git does not
-      // report as changed, so an ignored, untracked file can never reach here.
-      await run("git", ["add", "-f", "--", ...approval.files], cwd);
-      const output = await run("git", ["commit", "--only", "-m", message, "--", ...approval.files], cwd);
+      // Commits the index itself. Nothing is staged here: the operator already
+      // staged exactly what they want through the review panel, and re-adding
+      // would silently absorb later edits the drafted message never covered.
+      const output = await run("git", ["commit", "-m", message], cwd);
       // Released only now that the commit exists. A failure above leaves the
       // approval intact so the operator can fix the cause and retry without
       // re-approving a selection they never changed.

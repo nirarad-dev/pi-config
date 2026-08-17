@@ -26,7 +26,7 @@ type ModelResponse = {
   thinkingLevels?: Record<string, string[]>;
 };
 
-type GitFile = { filePath: string; status: string };
+type GitFile = { filePath: string; status: string; indexStatus?: string; worktreeStatus?: string };
 type WorktreeCandidate = { key: string; worktree: string; branch?: string };
 type WorktreeSource = { id: string; label: string; path: string; available: boolean };
 type CreateWorktreeSetup = { loading: boolean; sources: WorktreeSource[]; error?: string };
@@ -57,6 +57,8 @@ type AgentStatusSnapshot = {
   queued: boolean;
   needsUserInput: boolean;
   lastPromptFinishedAt?: number;
+  /** The agent spoke last in the transcript and has not been answered. */
+  awaitingReply?: boolean;
 };
 type AgentRailStatus = "working" | "queued" | "needs-input" | "ready" | "idle";
 type PendingChanges = { changed: number; staged: number };
@@ -66,7 +68,6 @@ type TaskRuntime = {
   provider?: string;
   modelId?: string;
   effort?: string;
-  selectedFiles: string[];
   approvalToken?: string;
   testFile?: string;
   testPreset: string;
@@ -83,7 +84,7 @@ const DEMO_TASKS: SprintTask[] = [
   { key: "DEV-4840", issueType: "Task", summary: "Expose vault health diagnostics", status: "To Do", priority: "Low", epicKey: "DEV-4800", epicName: "Operational visibility" },
 ];
 
-const initialRuntime = (): TaskRuntime => ({ selectedFiles: [], testPreset: TEST_PRESETS[0].id, testOptions: [], completed: [], reviewComments: [] });
+const initialRuntime = (): TaskRuntime => ({ testPreset: TEST_PRESETS[0].id, testOptions: [], completed: [], reviewComments: [] });
 const COMPLETED_STEPS_KEY = "sprintpilot-completed-steps-v1";
 const AGENT_STEPS: WorkflowStep[] = ["Plan", "Develop", "Pre-commit", "Deep review", "PR review"];
 const DEFAULT_PROVIDER = "anthropic";
@@ -184,22 +185,24 @@ function changeStatusClass(status: string): string {
   return styles.status_A;
 }
 
+function collectTreeFiles(nodes: SprintPilotChangeTreeNode[]): string[] {
+  return nodes.flatMap((node) => node.kind === "file" ? [node.path] : collectTreeFiles(node.children));
+}
+
 function ChangeTree({
   nodes,
   collapsed,
   activePath,
-  selectedPaths,
+  action,
   onToggleDirectory,
   onOpenFile,
-  onSelectFile,
 }: {
   nodes: SprintPilotChangeTreeNode[];
   collapsed: Set<string>;
   activePath?: string;
-  selectedPaths: Set<string>;
+  action: { kind: "stage" | "unstage"; disabled: boolean; onRun: (paths: string[]) => void };
   onToggleDirectory: (path: string) => void;
   onOpenFile: (path: string) => void;
-  onSelectFile: (path: string, selected: boolean) => void;
 }) {
   return <>{nodes.map((node) => {
     if (node.kind === "directory") {
@@ -211,14 +214,29 @@ function ChangeTree({
           <b>{node.name}</b>
           <small>{node.fileCount}</small>
         </button>
-        {isOpen && <div className={styles.treeChildren}><ChangeTree nodes={node.children} collapsed={collapsed} activePath={activePath} selectedPaths={selectedPaths} onToggleDirectory={onToggleDirectory} onOpenFile={onOpenFile} onSelectFile={onSelectFile}/></div>}
+        <button
+          type="button"
+          className={styles.treeRowAction}
+          disabled={action.disabled}
+          title={`${action.kind === "stage" ? "Stage" : "Unstage"} everything in ${node.path}`}
+          aria-label={`${action.kind === "stage" ? "Stage" : "Unstage"} everything in ${node.path}`}
+          onClick={() => action.onRun(collectTreeFiles([node]))}
+        >{action.kind === "stage" ? "→" : "←"}</button>
+        {isOpen && <div className={styles.treeChildren}><ChangeTree nodes={node.children} collapsed={collapsed} activePath={activePath} action={action} onToggleDirectory={onToggleDirectory} onOpenFile={onOpenFile}/></div>}
       </div>;
     }
 
     const status = node.status.slice(0, 1).toUpperCase();
     return <div className={`${styles.fileRow} ${styles.treeFileRow} ${activePath === node.path ? styles.activeFile : ""}`} key={node.path}>
-      <label className={styles.fileCheckbox} title={`Include ${node.path} in commit approval`}><input aria-label={`Include ${node.path} in commit approval`} type="checkbox" checked={selectedPaths.has(node.path)} onChange={(event) => onSelectFile(node.path, event.target.checked)}/></label>
       <button type="button" onClick={() => onOpenFile(node.path)} title={node.path}><span className={styles.treeFileIcon}>{getFileIcon(node.name, 15)}</span><span className={styles.fileIdentity}><b>{node.name}</b></span><em className={changeStatusClass(status)}>{status}</em></button>
+      <button
+        type="button"
+        className={styles.treeRowAction}
+        disabled={action.disabled}
+        title={action.kind === "stage" ? `Stage ${node.path}` : `Unstage ${node.path}`}
+        aria-label={action.kind === "stage" ? `Stage ${node.path}` : `Unstage ${node.path}`}
+        onClick={() => action.onRun([node.path])}
+      >{action.kind === "stage" ? "→" : "←"}</button>
     </div>;
   })}</>;
 }
@@ -386,6 +404,8 @@ export function SprintPilot() {
   const [restartStep, setRestartStep] = useState<WorkflowStep | null>(null);
   const [authSetup, setAuthSetup] = useState<AuthSetup | null>(null);
   const [pendingChanges, setPendingChanges] = useState<Record<string, PendingChanges>>({});
+  const [ignoredStagePrompt, setIgnoredStagePrompt] = useState<{ files: string[]; message: string } | null>(null);
+  const [stagingTab, setStagingTab] = useState<"changes" | "staged">("changes");
   const [commitSetup, setCommitSetup] = useState<CommitSetup | null>(null);
   const [pullRequestSetup, setPullRequestSetup] = useState<PullRequestSetup | null>(null);
   const [agentAlerts, setAgentAlerts] = useState<Record<string, AgentAlert>>({});
@@ -545,10 +565,18 @@ export function SprintPilot() {
       try {
         const result = await jsonRequest<{ pending: Record<string, PendingChanges> }>(`/api/sprintpilot/pending-changes?worktrees=${encodeURIComponent(worktreeKey)}`);
         if (cancelled) return;
-        setPendingChanges(Object.fromEntries(taskWorktrees.flatMap(({ key, worktree }) => {
+        const next = Object.fromEntries(taskWorktrees.flatMap(({ key, worktree }) => {
           const pending = result.pending[worktree];
           return pending ? [[key, pending] as const] : [];
-        })));
+        }));
+        setPendingChanges((previous) => {
+          // A task whose pending work just dropped to zero has been committed,
+          // which resolves the agent's turn as surely as replying to it does.
+          for (const [key, pending] of Object.entries(next)) {
+            if (pending.changed === 0 && (previous[key]?.changed || 0) > 0) clearAgentAlert(key);
+          }
+          return next;
+        });
       } catch {
         // A transient poll failure must not clear a badge the user is reading.
       } finally {
@@ -615,9 +643,12 @@ export function SprintPilot() {
               if (next[key] !== "attention") { next[key] = "attention"; changed = true; }
             } else if (running) {
               if (next[key]) { delete next[key]; changed = true; }
-            } else if (newlyFinished || previous?.running) {
+            } else if (snapshot.awaitingReply || newlyFinished || previous?.running) {
+              // awaitingReply comes from the transcript, so it still reports a
+              // waiting agent after a reload, a background tab, or the wrapper's
+              // idle timeout — none of which the live-only signals survived.
               if (next[key] !== "finished") { next[key] = "finished"; changed = true; }
-            } else if (next[key] === "attention") {
+            } else if (next[key]) {
               delete next[key];
               changed = true;
             }
@@ -702,11 +733,7 @@ export function SprintPilot() {
     ]);
     setGitFiles(git.files);
     setTestFiles(tests.files);
-    const availableFiles = new Set(git.files.map((file) => file.filePath.replace(`${state.worktree}/`, "")));
-    if (state.selectedFiles.some((file) => !availableFiles.has(file))) {
-      updateRuntime({ approvalToken: undefined, selectedFiles: state.selectedFiles.filter((file) => availableFiles.has(file)) });
-    }
-  }, [state.worktree, state.selectedFiles, updateRuntime]);
+  }, [state.worktree]);
 
   const refreshHistory = useCallback(async (skip = 0, append = false) => {
     if (!state.worktree) {
@@ -911,7 +938,7 @@ export function SprintPilot() {
       await jsonRequest("/api/sprintpilot/worktree", {
         method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cwd: deleteTarget.worktree }),
       });
-      updateRuntime({ worktree: undefined, branch: undefined, sessionId: undefined, approvalToken: undefined, selectedFiles: [], completed: task ? completedStepsForJiraStatus(task.status) : [] });
+      updateRuntime({ worktree: undefined, branch: undefined, sessionId: undefined, approvalToken: undefined, completed: task ? completedStepsForJiraStatus(task.status) : [] });
       setDeleteTarget(null);
       setNotice(`Deleted the ${deleteTarget.key} worktree. Its Git branch was retained.`);
     } catch (error) {
@@ -980,19 +1007,63 @@ export function SprintPilot() {
     finally { setBusy(null); }
   };
 
+  const openChangedFile = useCallback((path: string) => {
+    const file = gitFiles.find((candidate) => (state.worktree ? candidate.filePath.replace(`${state.worktree}/`, "") : candidate.filePath) === path);
+    if (file) void inspectDiff(file);
+    // inspectDiff is stable for the active worktree; gitFiles is the live list.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gitFiles, state.worktree]);
+
+  const toggleChangeFolder = useCallback((path: string) => setCollapsedChangeFolders((current) => {
+    const next = new Set(current);
+    if (next.has(path)) next.delete(path);
+    else next.add(path);
+    return next;
+  }), []);
+
+  /**
+   * Stage or unstage through Git itself. The index is the commit, so the panel
+   * never keeps its own parallel idea of what is included; it re-reads the
+   * worktree afterwards and renders whatever Git now reports.
+   */
+  const runStaging = async (action: "stage" | "unstage", files: string[], force = false) => {
+    if (!state.worktree || !files.length) return;
+    setBusy(action);
+    try {
+      const response = await fetch("/api/sprintpilot/git", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, cwd: state.worktree, files, force }),
+      });
+      const result = await response.json() as { error?: string; ignored?: boolean };
+      if (response.status === 409 && result.ignored) {
+        setIgnoredStagePrompt({ files, message: result.error || "Those paths are ignored by a .gitignore rule." });
+        return;
+      }
+      if (!response.ok) throw new Error(result.error || `Request failed (${response.status})`);
+      // Drafting is bound to the exact staged set, so changing it invalidates
+      // any message already approved for the previous one.
+      updateRuntime({ approvalToken: undefined });
+      await refreshWorkspace();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const gitAction = async (action: "approve" | "commit" | "push" | "pr", extra: Record<string, unknown> = {}) => {
     if (!state.worktree || !task) return;
     setBusy(action);
     try {
       const result = await jsonRequest<{ approvalToken?: string; output?: string; url?: string; jiraDevelopment?: { state: "linked" | "pending" | "unavailable"; error?: string } }>("/api/sprintpilot/git", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action, cwd: state.worktree, files: state.selectedFiles, approvalToken: state.approvalToken, title: `${task.key}: ${task.summary}`, ...extra }),
+        body: JSON.stringify({ action, cwd: state.worktree, approvalToken: state.approvalToken, title: `${task.key}: ${task.summary}`, ...extra }),
       });
       if (action === "commit") {
         setCommitSetup(null);
         setActiveDiffFile(undefined);
         setDiff("");
-        updateRuntime({ approvalToken: undefined, selectedFiles: [], completed: normalizeCompletedSteps(state.completed, ["Commit"]) });
+        updateRuntime({ approvalToken: undefined, completed: normalizeCompletedSteps(state.completed, ["Commit"]) });
         const refreshes = await Promise.allSettled([refreshWorkspace(), refreshHistory(0)]);
         const refreshFailure = refreshes.find((refresh) => refresh.status === "rejected");
         if (refreshFailure?.status === "rejected") {
@@ -1016,14 +1087,14 @@ export function SprintPilot() {
   };
 
   const prepareCommit = async () => {
-    if (!state.worktree || !state.selectedFiles.length || !task) return;
+    if (!state.worktree || !task) return;
     setCommitSetup({ phase: "loading", message: "" });
     setBusy("commit-message");
     try {
       const sessionId = await ensureTaskSession();
       const result = await jsonRequest<{ message: string; approvalToken: string } & DraftOrigin>("/api/sprintpilot/git", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "commit-message", cwd: state.worktree, files: state.selectedFiles, approvalToken: state.approvalToken, sessionId, taskKey: task.key, summary: task.summary, taskDescription: task.description, title: `${task.key}: ${task.summary}` }),
+        body: JSON.stringify({ action: "commit-message", cwd: state.worktree, sessionId, taskKey: task.key, summary: task.summary, taskDescription: task.description, title: `${task.key}: ${task.summary}` }),
       });
       updateRuntime({ sessionId, approvalToken: result.approvalToken });
       setCommitSetup({ phase: "ready", message: result.message, generatedBy: result.generatedBy, model: result.model, fallbackReason: result.fallbackReason });
@@ -1058,13 +1129,24 @@ export function SprintPilot() {
     source: file,
     relativePath: state.worktree ? file.filePath.replace(`${state.worktree}/`, "") : file.filePath,
   })), [gitFiles, state.worktree]);
-  const changedFilePaths = relativeGitFiles.map((file) => file.relativePath);
-  const changedFilesByPath = new Map(relativeGitFiles.map((file) => [file.relativePath, file.source]));
-  const changeTree = useMemo(() => buildSprintPilotChangeTree(relativeGitFiles.map((file) => ({
-    filePath: file.relativePath,
-    status: file.source.status,
-  }))), [relativeGitFiles]);
-  const selectedFilePaths = new Set(state.selectedFiles);
+  const stagedFiles = useMemo(
+    () => relativeGitFiles.filter((file) => file.source.indexStatus && !" ?".includes(file.source.indexStatus)).map((file) => file.relativePath).sort(),
+    [relativeGitFiles],
+  );
+  // A path can be in both columns: "MM" is a staged change with further edits
+  // on top. Git reports it that way and the panel shows it that way.
+  const unstagedFiles = useMemo(
+    () => relativeGitFiles.filter((file) => file.source.worktreeStatus && file.source.worktreeStatus !== " ").map((file) => file.relativePath).sort(),
+    [relativeGitFiles],
+  );
+  const stagedTree = useMemo(
+    () => buildSprintPilotChangeTree(relativeGitFiles.filter((file) => stagedFiles.includes(file.relativePath)).map((file) => ({ filePath: file.relativePath, status: file.source.status }))),
+    [relativeGitFiles, stagedFiles],
+  );
+  const unstagedTree = useMemo(
+    () => buildSprintPilotChangeTree(relativeGitFiles.filter((file) => unstagedFiles.includes(file.relativePath)).map((file) => ({ filePath: file.relativePath, status: file.source.status }))),
+    [relativeGitFiles, unstagedFiles],
+  );
   const activeDiffPath = activeDiffFile
     ? (state.worktree ? activeDiffFile.replace(`${state.worktree}/`, "") : activeDiffFile)
     : undefined;
@@ -1170,26 +1252,35 @@ export function SprintPilot() {
             </section>
 
             <section className={`${styles.panel} ${styles.changesPanel}`}>
-              <div className={styles.panelHead}><span>REVIEW FILES &amp; COMMIT</span><small className={state.approvalToken ? styles.approvedState : styles.pendingState}>{state.approvalToken ? `✓ ${state.selectedFiles.length} FILES READY` : `${gitFiles.length} CHANGED · SELECT FILES`}</small></div>
-              <div className={styles.reviewTools}><button disabled={!gitFiles.length || !!busy} onClick={() => updateRuntime({ approvalToken: undefined, selectedFiles: changedFilePaths })}>SELECT ALL</button><button disabled={!state.selectedFiles.length || !!busy} onClick={() => updateRuntime({ approvalToken: undefined, selectedFiles: [] })}>CLEAR</button><button disabled={!state.worktree || !!busy} onClick={() => refreshWorkspace().then(() => setNotice("Pending changes refreshed.")).catch((error) => setNotice(error.message))}>REFRESH CHANGES</button><span>{state.selectedFiles.length} OF {gitFiles.length} SELECTED</span></div>
+              <div className={styles.panelHead}><span>REVIEW FILES &amp; COMMIT</span><small className={state.approvalToken ? styles.approvedState : styles.pendingState}>{state.approvalToken ? `✓ ${stagedFiles.length} STAGED · MESSAGE READY` : `${stagedFiles.length} STAGED · ${unstagedFiles.length} UNSTAGED`}</small></div>
+              <div className={styles.reviewTools}><button disabled={!state.worktree || !!busy} onClick={() => refreshWorkspace().then(() => setNotice("Pending changes refreshed.")).catch((error) => setNotice(error.message))}>REFRESH CHANGES</button><span>Stage what belongs in this commit, then draft the message.</span></div>
               <div className={styles.changeLayout}>
-                <div className={styles.fileExplorer}><div className={styles.explorerHead}><span>CHANGES</span><b>{gitFiles.length}</b></div><div className={styles.fileList}>{gitFiles.length ? <ChangeTree
-                  nodes={changeTree}
-                  collapsed={collapsedChangeFolders}
-                  activePath={activeDiffPath}
-                  selectedPaths={selectedFilePaths}
-                  onToggleDirectory={(path) => setCollapsedChangeFolders((current) => {
-                    const next = new Set(current);
-                    if (next.has(path)) next.delete(path);
-                    else next.add(path);
-                    return next;
-                  })}
-                  onOpenFile={(path) => {
-                    const file = changedFilesByPath.get(path);
-                    if (file) void inspectDiff(file);
-                  }}
-                  onSelectFile={(path, selected) => updateRuntime({ approvalToken: undefined, selectedFiles: selected ? [...state.selectedFiles, path] : state.selectedFiles.filter((item) => item !== path) })}
-                /> : <p className={styles.empty}>{state.worktree ? "No pending changes detected. Use Refresh changes after the development session edits files." : "Link or create a worktree to review its files."}</p>}</div></div>
+                <div className={styles.fileExplorer}>
+                  <div className={styles.stagingTabs} role="tablist" aria-label="Changed and staged files">
+                    <button type="button" role="tab" aria-selected={stagingTab === "changes"} className={stagingTab === "changes" ? styles.activeStagingTab : ""} onClick={() => setStagingTab("changes")}>CHANGES <b>{unstagedFiles.length}</b></button>
+                    <button type="button" role="tab" aria-selected={stagingTab === "staged"} className={stagingTab === "staged" ? styles.activeStagingTab : ""} onClick={() => setStagingTab("staged")}>STAGED <b>{stagedFiles.length}</b></button>
+                    {stagingTab === "changes"
+                      ? unstagedFiles.length > 0 && <button type="button" className={styles.columnAction} disabled={!!busy} title="Stage every change" aria-label="Stage every change" onClick={() => runStaging("stage", unstagedFiles)}>STAGE ALL →</button>
+                      : stagedFiles.length > 0 && <button type="button" className={styles.columnAction} disabled={!!busy} title="Unstage everything" aria-label="Unstage everything" onClick={() => runStaging("unstage", stagedFiles)}>← UNSTAGE ALL</button>}
+                  </div>
+                  <div className={styles.fileList}>{stagingTab === "changes"
+                    ? (unstagedFiles.length ? <ChangeTree
+                      nodes={unstagedTree}
+                      collapsed={collapsedChangeFolders}
+                      activePath={activeDiffPath}
+                      action={{ kind: "stage", disabled: !!busy, onRun: (paths) => runStaging("stage", paths) }}
+                      onToggleDirectory={toggleChangeFolder}
+                      onOpenFile={openChangedFile}
+                    /> : <p className={styles.empty}>{state.worktree ? "Nothing unstaged." : "Link or create a worktree to review its files."}</p>)
+                    : (stagedFiles.length ? <ChangeTree
+                      nodes={stagedTree}
+                      collapsed={collapsedChangeFolders}
+                      activePath={activeDiffPath}
+                      action={{ kind: "unstage", disabled: !!busy, onRun: (paths) => runStaging("unstage", paths) }}
+                      onToggleDirectory={toggleChangeFolder}
+                      onOpenFile={openChangedFile}
+                    /> : <p className={styles.empty}>Nothing staged yet. Stage from Changes with →.</p>)}</div>
+                </div>
                 <DiffEditor
                   filePath={activeDiffFile ? (state.worktree ? activeDiffFile.replace(`${state.worktree}/`, "") : activeDiffFile) : undefined}
                   patch={diff}
@@ -1202,9 +1293,9 @@ export function SprintPilot() {
                 <div><b>{pendingReviewComments.length ? `${pendingReviewComments.length} REVIEW ${pendingReviewComments.length === 1 ? "COMMENT" : "COMMENTS"} READY` : "NO UNSENT REVIEW COMMENTS"}</b><span>Use the + control beside a changed line to attach a precise fix reference.</span></div>
                 <button className={styles.sendReviewButton} disabled={!pendingReviewComments.length || !state.worktree || !state.provider || !state.modelId || !!busy} onClick={sendReviewComments}>{busy === "review-comments" ? "SENDING TO AGENT…" : `SEND ${pendingReviewComments.length || ""} TO AGENT`}</button>
               </div>
-              <div className={styles.approvalNote}>{state.approvalToken ? <span className={styles.approvedState}>✓ The reviewed message is bound to the selected file contents for 30 minutes.</span> : <span>Select files and review their patches. Generating the commit message captures the exact contents for commit.</span>}</div>
+              <div className={styles.approvalNote}>{state.approvalToken ? <span className={styles.approvedState}>✓ The reviewed message is bound to exactly what is staged now. Staging or unstaging anything asks you to draft it again.</span> : <span>Stage what belongs in this commit with →, then draft the message. The commit records the staged files, nothing else.</span>}</div>
               <div className={styles.gitGates}>
-                <button disabled={!state.selectedFiles.length || !!busy} onClick={prepareCommit}>1 · REVIEW COMMIT MESSAGE</button>
+                <button disabled={!stagedFiles.length || !!busy} onClick={prepareCommit}>1 · REVIEW COMMIT MESSAGE</button>
                 <button disabled={!state.worktree || !!busy} onClick={() => gitAction("push")}>2 · PUSH BRANCH</button>
                 <div className={styles.prSplit}><button disabled={!state.worktree || !state.provider || !state.modelId || !!busy} onClick={() => preparePullRequest(true)}>3A · DRAFT PR DETAILS</button><button disabled={!state.worktree || !state.provider || !state.modelId || !!busy} onClick={() => preparePullRequest(false)}>3B · READY PR DETAILS</button></div>
               </div>
@@ -1263,6 +1354,19 @@ export function SprintPilot() {
         {pullRequestSetup.phase === "error" && <p className={styles.authError}>{pullRequestSetup.error}</p>}
         {pullRequestSetup.phase === "ready" && <><label>PR TITLE<input autoFocus value={pullRequestSetup.title} onChange={(event) => setPullRequestSetup({ ...pullRequestSetup, title: event.target.value })}/></label><label>DESCRIPTION<textarea value={pullRequestSetup.description} onChange={(event) => setPullRequestSetup({ ...pullRequestSetup, description: event.target.value })}/></label><DraftProvenance origin={pullRequestSetup}/></>}
         <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setPullRequestSetup(null)}>CANCEL</button><button disabled={pullRequestSetup.phase === "loading" || !!busy} onClick={() => preparePullRequest(pullRequestSetup.draft)}>{busy === "pr-metadata" ? "DRAFTING…" : "REGENERATE"}</button><button className={styles.primary} disabled={pullRequestSetup.phase !== "ready" || !pullRequestSetup.title.trim() || !pullRequestSetup.description.trim() || !!busy} onClick={async () => { if (await gitAction("pr", { draft: pullRequestSetup.draft, title: pullRequestSetup.title, description: pullRequestSetup.description })) setPullRequestSetup(null); }}>{busy === "pr" ? "OPENING…" : pullRequestSetup.draft ? "OPEN DRAFT PR" : "OPEN READY PR"}</button></div>
+      </section>
+    </div>}
+    {ignoredStagePrompt && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setIgnoredStagePrompt(null); }}>
+      <section className={styles.modal} role="alertdialog" aria-modal="true" aria-labelledby="ignored-stage-title">
+        <span className={styles.modalKicker}>IGNORED PATH</span>
+        <h2 id="ignored-stage-title">Stage a file Git is set to ignore?</h2>
+        <p>{ignoredStagePrompt.message}</p>
+        <ul>{ignoredStagePrompt.files.map((file) => <li key={file}><code>{file}</code></li>)}</ul>
+        <p>A tracked file inside an ignored directory needs this. An untracked one is ignored for a reason — check it is not a local secret before continuing.</p>
+        <div className={styles.modalActions}>
+          <button disabled={!!busy} onClick={() => setIgnoredStagePrompt(null)}>CANCEL</button>
+          <button className={styles.primary} disabled={!!busy} onClick={() => { const files = ignoredStagePrompt.files; setIgnoredStagePrompt(null); void runStaging("stage", files, true); }}>STAGE ANYWAY</button>
+        </div>
       </section>
     </div>}
     {deleteTarget && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setDeleteTarget(null); }}>
