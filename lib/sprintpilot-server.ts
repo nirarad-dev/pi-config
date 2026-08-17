@@ -98,8 +98,58 @@ function safeRelativeFiles(files: unknown): string[] {
   return selected.sort();
 }
 
+/**
+ * Paths Git currently reports as changed in this worktree.
+ *
+ * Renames report both sides; either name is a legitimate thing to commit.
+ */
+export function parseChangedPaths(output: string): Set<string> {
+  const records = output.split("\0");
+  const paths = new Set<string>();
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    if (!record || record.length < 4 || record[2] !== " ") continue;
+    paths.add(record.slice(3));
+    // A rename emits the original path as the following NUL-separated record.
+    // Both names are legitimate things to commit, and skipping the extra record
+    // keeps it from being misread as another status line.
+    if ("RC".includes(record[0]) || "RC".includes(record[1])) {
+      const original = records[++index];
+      if (original) paths.add(original);
+    }
+  }
+  return paths;
+}
+
+export async function changedPaths(cwd: string): Promise<Set<string>> {
+  // Deliberately NOT through `run()`, which trims its output. A porcelain
+  // record for an unstaged change begins with a space (" M path"), so trimming
+  // shifts the first record's status field and the parser drops that one file —
+  // reporting the operator's first changed file as "not changed".
+  //
+  // Parsed here rather than through lib/git-status.ts because this module is
+  // loaded directly by its unit test under node's type-stripping loader, which
+  // cannot resolve the extensionless relative imports the rest of lib/ uses.
+  const { stdout } = await execFileAsync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], {
+    cwd,
+    env: { ...process.env, LC_ALL: "C" },
+    maxBuffer: MAX_BUFFER,
+  });
+  return parseChangedPaths(stdout);
+}
+
 export async function snapshotChanges(cwd: string, filesInput: unknown): Promise<{ files: string[]; hash: string }> {
   const files = safeRelativeFiles(filesInput);
+  // Every approved file must be one Git actually reports as changed. The commit
+  // action stages with `git add -f`, because a tracked file inside a directory
+  // matched by .gitignore cannot be staged otherwise; this check is what keeps
+  // that `-f` narrow. Without it a crafted request could name any ignored path
+  // — a local `.env`, a credentials file — and force it into a commit.
+  const changed = await changedPaths(cwd);
+  const unknown = files.filter((file) => !changed.has(file));
+  if (unknown.length > 0) {
+    throw new Error(`Git does not report these files as changed: ${unknown.join(", ")}`);
+  }
   const hash = createHash("sha256");
   hash.update(await run("git", ["rev-parse", "HEAD"], cwd));
   hash.update(await run("git", ["status", "--porcelain=v1", "--", ...files], cwd));
@@ -112,7 +162,7 @@ export async function snapshotChanges(cwd: string, filesInput: unknown): Promise
   return { files, hash: hash.digest("hex") };
 }
 
-type Approval = { cwd: string; files: string[]; hash: string; expiresAt: number };
+type Approval = { cwd: string; files: string[]; hash: string };
 declare global { var __sprintPilotApprovals: Map<string, Approval> | undefined; }
 
 function approvals() {
@@ -120,26 +170,37 @@ function approvals() {
   return globalThis.__sprintPilotApprovals;
 }
 
+/**
+ * Approvals do not expire.
+ *
+ * The file list is the operator's own checkbox selection in the review panel,
+ * and committing is their explicit click; a clock adds no safety on top of
+ * that. The expiry only ever fired while the operator was reading the drafted
+ * message, turning a finished review into "Approval expired; review the changes
+ * again". What actually guards the commit is the content hash below, which
+ * still refuses to commit bytes that changed since the diff was reviewed.
+ */
 export function createApproval(cwd: string, files: string[], hash: string) {
   const token = randomUUID();
-  approvals().set(token, { cwd, files, hash, expiresAt: Date.now() + 30 * 60_000 });
+  approvals().set(token, { cwd, files, hash });
   return token;
-}
-
-export function takeApproval(token: unknown): Approval {
-  if (typeof token !== "string") throw new Error("Approval token is required");
-  const approval = approvals().get(token);
-  approvals().delete(token);
-  if (!approval || approval.expiresAt < Date.now()) throw new Error("Approval expired; review the changes again");
-  return approval;
 }
 
 export function readApproval(token: unknown): Approval {
   if (typeof token !== "string") throw new Error("Approval token is required");
   const approval = approvals().get(token);
-  if (!approval || approval.expiresAt < Date.now()) {
-    if (approval) approvals().delete(token);
-    throw new Error("Approval expired; review the changes again");
-  }
+  if (!approval) throw new Error("That approval is no longer available; review the changes and draft the commit message again");
   return approval;
+}
+
+/**
+ * Release an approval once its commit has actually landed.
+ *
+ * Deliberately separate from reading it. `takeApproval` used to delete the
+ * token before validating anything, so any later failure — a hash mismatch, or
+ * a `git add` that refused an ignored path — consumed the approval anyway and
+ * every retry reported "Approval expired", which described neither problem.
+ */
+export function releaseApproval(token: unknown): void {
+  if (typeof token === "string") approvals().delete(token);
 }

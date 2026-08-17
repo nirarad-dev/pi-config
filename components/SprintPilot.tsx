@@ -126,7 +126,11 @@ const AGENT_RAIL_STATUS: Record<AgentRailStatus, { label: string; title: string 
   working: { label: "WORKING", title: "The task agent is working" },
   queued: { label: "QUEUED", title: "A follow-up is queued after current agent work" },
   "needs-input": { label: "NEEDS INPUT", title: "The task agent is waiting for your input" },
-  ready: { label: "READY", title: "The task agent finished its latest work" },
+  // "The agent stopped" and "the agent asked you something" are the same
+  // observable state: needsUserInput only fires for extension UI dialogs, not
+  // for a question the agent wrote as text. Wording this as awaiting a reply
+  // covers both, and the alert stays until the operator actually replies.
+  ready: { label: "AWAITING YOU", title: "The task agent finished and is waiting for your reply. This clears when you send it something." },
   idle: { label: "IDLE", title: "The task chat is open and waiting" },
 };
 
@@ -411,9 +415,9 @@ export function SprintPilot() {
     });
   }, [activeKey]);
 
-  const clearFinishedAlert = useCallback((key: string) => {
+  const clearAgentAlert = useCallback((key: string) => {
     setAgentAlerts((current) => {
-      if (current[key] !== "finished") return current;
+      if (!current[key]) return current;
       const next = { ...current };
       delete next[key];
       return next;
@@ -565,6 +569,11 @@ export function SprintPilot() {
   }, [worktreeKey]);
 
   const sortedTasks = useMemo(() => sortSprintTasks(tasks), [tasks]);
+  // Tasks whose agent stopped or asked something and has not been answered.
+  const awaitingKeys = useMemo(
+    () => sortedTasks.filter((item) => agentAlerts[item.key]).map((item) => item.key),
+    [sortedTasks, agentAlerts],
+  );
 
   useEffect(() => {
     if (!taskAgentSessions.length) return;
@@ -741,7 +750,10 @@ export function SprintPilot() {
         completed: normalizeCompletedSteps(selectedTask ? completedStepsForJiraStatus(selectedTask.status) : [], storedCompletedSteps(key)),
       } };
     });
-    clearFinishedAlert(key);
+    // Deliberately not cleared here. Opening the tab is how the operator reads
+    // what the agent said; dismissing the signal at that moment meant a task
+    // waiting on a reply looked identical to one with nothing pending. The
+    // alert is released when the operator actually answers, in queueTaskPrompt.
     setActiveKey(key);
   };
 
@@ -780,6 +792,9 @@ export function SprintPilot() {
 
   const queueTaskPrompt = async (message: string, fresh = false) => {
     let sessionId = await ensureTaskSession(fresh);
+    // Answering the agent is what resolves the alert, whichever surface the
+    // prompt came from.
+    clearAgentAlert(activeKey);
     try {
       await sendAgentCommand(sessionId, { type: "prompt", message, streamingBehavior: "followUp" });
     } catch (error) {
@@ -794,7 +809,7 @@ export function SprintPilot() {
   const sendWorkflowPrompt = async (step: WorkflowStep) => {
     const prompt = task ? sprintPilotWorkflowPrompt(step, task) : undefined;
     if (!task || !state.worktree || !state.provider || !state.modelId || !prompt) return;
-    clearFinishedAlert(task.key);
+    clearAgentAlert(task.key);
     setBusy(step);
     try {
       const sessionId = await queueTaskPrompt(prompt);
@@ -809,7 +824,7 @@ export function SprintPilot() {
 
   const openTaskConversation = async (fresh = false) => {
     if (!task || !state.worktree || !state.provider || !state.modelId) return;
-    clearFinishedAlert(task.key);
+    clearAgentAlert(task.key);
     setBusy(fresh ? "fresh-development-session" : "development-session");
     try {
       const sessionId = await ensureTaskSession(fresh);
@@ -1075,6 +1090,12 @@ export function SprintPilot() {
     <div className={styles.layout}>
       <aside className={styles.sidebar}>
         <div className={styles.sectionLabel}>CURRENT SPRINT <span>{tasks.length}</span></div>
+        {awaitingKeys.length > 0 && <button
+          type="button"
+          className={styles.awaitingBanner}
+          title="Jump to the task whose agent is waiting for a reply"
+          onClick={() => openTask(awaitingKeys[0])}
+        ><i/><b>{awaitingKeys.length} AGENT{awaitingKeys.length === 1 ? "" : "S"} AWAITING YOU</b><span>{awaitingKeys.join(" · ")}</span></button>}
         <div className={styles.jiraSyncBar}><button disabled={jiraRefreshing} onClick={() => syncJiraTasks({ announce: true })}><span aria-hidden="true">↻</span>{jiraRefreshing ? "SYNCING JIRA…" : "REFRESH JIRA"}</button><small title={lastJiraSync ? `Last synced ${lastJiraSync.toLocaleString()}` : "Waiting for first sync"}>AUTO · 1 MIN{lastJiraSync ? ` · ${lastJiraSync.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}</small></div>
         {!jiraConfigured && <p className={styles.jiraWarning}><b>DEMO DATA</b> Jira is not connected. Copy <code>sprintpilot.env.example</code> to <code>.env.local</code>, add your Jira email and API token, then restart the app.</p>}
         <div className={styles.taskList}>{SPRINT_TASK_GROUPS.flatMap((group) => {

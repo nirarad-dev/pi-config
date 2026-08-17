@@ -19,7 +19,21 @@ test("renders the alert on its relevant Jira ticket card", () => {
   assert.match(source, /NEEDS INPUT/);
   assert.match(source, /WORKING/);
   assert.match(source, /QUEUED/);
-  assert.match(source, /READY/);
+  assert.match(source, /AWAITING YOU/);
   assert.match(source, /IDLE/);
-  assert.match(source, /clearFinishedAlert\(key\)/);
+});
+
+test("an alert survives opening the task and clears only when the agent is answered", () => {
+  // Opening the tab is how the operator reads what the agent said, so it must
+  // not dismiss the signal; sending a prompt is the act that resolves it.
+  const openTask = source.slice(source.indexOf("const openTask ="), source.indexOf("const handleFlowStep"));
+  assert.doesNotMatch(openTask, /clearAgentAlert/);
+  const queuePrompt = source.slice(source.indexOf("const queueTaskPrompt ="), source.indexOf("const sendWorkflowPrompt"));
+  assert.match(queuePrompt, /clearAgentAlert\(activeKey\)/);
+});
+
+test("the rail summarizes every task still awaiting a reply", () => {
+  assert.match(source, /awaitingKeys/);
+  assert.match(source, /AWAITING YOU<\/b>/);
+  assert.match(source, /openTask\(awaitingKeys\[0\]\)/);
 });

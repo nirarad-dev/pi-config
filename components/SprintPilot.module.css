@@ -114,3 +114,9 @@
 .taskPendingSignal i{width:7px;height:7px;border-radius:50%;background:currentColor}
 .draftProvenance{margin:8px 0 0;font-size:10px;letter-spacing:.06em;color:#8d969f}
 .draftProvenanceFallback{color:#ffbe4f}
+
+.awaitingBanner{appearance:none;width:100%;text-align:left;margin:10px 0 0;border:1px solid #ffbe4f;border-left-width:3px;background:#171106;color:#ffbe4f;font:inherit;display:grid;grid-template-columns:auto 1fr;gap:2px 8px;padding:9px 10px;cursor:pointer}
+.awaitingBanner i{grid-row:1/3;align-self:center;width:8px;height:8px;border-radius:50%;background:currentColor;animation:agentAttentionPulse 1.4s ease-in-out infinite}
+.awaitingBanner b{font-size:10px;font-weight:900;letter-spacing:.1em}
+.awaitingBanner span{font-size:10px;color:#c8ac7d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.awaitingBanner:hover{background:#1f1708}

@@ -6,7 +6,7 @@ import { checkSprintPilotPullRequestInJira } from "@/lib/sprintpilot-jira-links"
 import { appendArnacAiDisclosure, sprintPilotJiraUrl } from "@/lib/sprintpilot-pr-metadata";
 import { getRpcSession, startRpcSession } from "@/lib/rpc-manager";
 import { resolveSessionPath } from "@/lib/session-reader";
-import { assertSprintWorktree, createApproval, readApproval, run, snapshotChanges, takeApproval } from "@/lib/sprintpilot-server";
+import { assertSprintWorktree, createApproval, readApproval, releaseApproval, run, snapshotChanges } from "@/lib/sprintpilot-server";
 
 function jiraKeyFromBranch(branch: string) {
   return branch.match(/(?:^|\/)([A-Z][A-Z0-9]+-\d+)(?:-|$)/)?.[1];
@@ -60,14 +60,24 @@ export async function POST(request: Request) {
     }
 
     if (action === "commit") {
-      const approval = takeApproval(body.approvalToken);
+      const approval = readApproval(body.approvalToken);
       if (approval.cwd !== cwd) throw new Error("Approval belongs to another worktree");
       const current = await snapshotChanges(cwd, approval.files);
-      if (current.hash !== approval.hash) throw new Error("Changes moved since approval; review and approve them again");
+      if (current.hash !== approval.hash) throw new Error("The selected files changed since you reviewed them; draft the commit message again to pick up the new content");
       const message = String(body.message || "").trim();
       if (!message) throw new Error("Commit message is required");
-      await run("git", ["add", "--", ...approval.files], cwd);
+      // `-f` is required, not a shortcut: a tracked file inside a directory
+      // matched by .gitignore (arnac has a generic `env/` virtualenv rule that
+      // also catches automation/config/env) cannot be staged without it, and a
+      // plain `git add` fails the whole commit. The force stays narrow because
+      // `snapshotChanges` already rejected any approved path Git does not
+      // report as changed, so an ignored, untracked file can never reach here.
+      await run("git", ["add", "-f", "--", ...approval.files], cwd);
       const output = await run("git", ["commit", "--only", "-m", message, "--", ...approval.files], cwd);
+      // Released only now that the commit exists. A failure above leaves the
+      // approval intact so the operator can fix the cause and retry without
+      // re-approving a selection they never changed.
+      releaseApproval(body.approvalToken);
       return NextResponse.json({ success: true, output });
     }
 
