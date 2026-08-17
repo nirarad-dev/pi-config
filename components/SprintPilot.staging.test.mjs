@@ -48,6 +48,22 @@ test("committing everything clears the awaiting-you signal", () => {
   assert.match(source, /clearAgentAlert\(key\)/);
 });
 
+test("one pull-request gate, with draft and ready chosen on the review screen", () => {
+  // Draft-versus-ready is a decision about the title and body, so it is made
+  // against them rather than before they exist.
+  assert.match(source, /3 · OPEN PULL REQUEST/);
+  assert.doesNotMatch(source, /3A ·|3B ·|prSplit/);
+  assert.match(source, /const preparePullRequest = async \(\) =>/);
+  assert.match(source, /OPEN AS DRAFT/);
+  assert.match(source, /OPEN READY FOR REVIEW/);
+  // Both actions send the same reviewed text; only the draft flag differs.
+  assert.match(source, /gitAction\("pr", \{ draft: mode\.draft, title: pullRequestSetup\.title, description: pullRequestSetup\.description \}\)/);
+});
+
+test("only the pressed pull-request button reports progress", () => {
+  assert.match(source, /pullRequestSetup\.opening === mode\.draft/);
+});
+
 test("the diff paints word-level detail under the highlighted text", () => {
   // The highlighter owns the line's markup, so segment backgrounds go on a
   // character-identical layer beneath it rather than inside it.

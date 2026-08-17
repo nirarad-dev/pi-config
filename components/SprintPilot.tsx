@@ -51,7 +51,7 @@ type AuthSetup = {
 };
 type DraftOrigin = { generatedBy?: "agent" | "repaired" | "fallback"; model?: { provider: string; id: string; fast: boolean }; fallbackReason?: string };
 type CommitSetup = DraftOrigin & { phase: "loading" | "ready" | "error"; message: string; error?: string };
-type PullRequestSetup = DraftOrigin & { phase: "loading" | "ready" | "error"; draft: boolean; title: string; description: string; error?: string };
+type PullRequestSetup = DraftOrigin & { phase: "loading" | "ready" | "error"; title: string; description: string; error?: string; opening?: boolean };
 type AgentAlert = "finished" | "attention";
 type AgentStatusSnapshot = {
   running: boolean;
@@ -1135,9 +1135,9 @@ export function SprintPilot() {
     }
   };
 
-  const preparePullRequest = async (draft: boolean) => {
+  const preparePullRequest = async () => {
     if (!task || !state.worktree || !state.provider || !state.modelId) return;
-    setPullRequestSetup({ phase: "loading", draft, title: "", description: "" });
+    setPullRequestSetup({ phase: "loading", title: "", description: "" });
     setBusy("pr-metadata");
     try {
       const sessionId = await ensureTaskSession();
@@ -1146,9 +1146,9 @@ export function SprintPilot() {
         body: JSON.stringify({ cwd: state.worktree, sessionId, taskKey: task.key, summary: task.summary, taskDescription: task.description }),
       });
       updateRuntime({ sessionId });
-      setPullRequestSetup({ phase: "ready", draft, title: metadata.title, description: metadata.description, generatedBy: metadata.generatedBy, model: metadata.model });
+      setPullRequestSetup({ phase: "ready", title: metadata.title, description: metadata.description, generatedBy: metadata.generatedBy, model: metadata.model });
     } catch (error) {
-      setPullRequestSetup({ phase: "error", draft, title: "", description: "", error: error instanceof Error ? error.message : String(error) });
+      setPullRequestSetup({ phase: "error", title: "", description: "", error: error instanceof Error ? error.message : String(error) });
     } finally { setBusy(null); }
   };
 
@@ -1327,7 +1327,7 @@ export function SprintPilot() {
               <div className={styles.gitGates}>
                 <button disabled={!stagedFiles.length || !!busy} onClick={prepareCommit}>1 · REVIEW COMMIT MESSAGE</button>
                 <button disabled={!state.worktree || !!busy} onClick={() => gitAction("push")}>2 · PUSH BRANCH</button>
-                <div className={styles.prSplit}><button disabled={!state.worktree || !state.provider || !state.modelId || !!busy} onClick={() => preparePullRequest(true)}>3A · DRAFT PR DETAILS</button><button disabled={!state.worktree || !state.provider || !state.modelId || !!busy} onClick={() => preparePullRequest(false)}>3B · READY PR DETAILS</button></div>
+                <button className={styles.prGate} disabled={!state.worktree || !state.provider || !state.modelId || !!busy} onClick={() => preparePullRequest()}>3 · OPEN PULL REQUEST</button>
               </div>
             </section>
 
@@ -1377,13 +1377,26 @@ export function SprintPilot() {
     </div>}
     {pullRequestSetup && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setPullRequestSetup(null); }}>
       <section className={`${styles.modal} ${styles.commitModal}`} role="dialog" aria-modal="true" aria-labelledby="pr-metadata-title">
-        <span className={styles.modalKicker}>AGENT-GENERATED PR METADATA</span>
+        <span className={styles.modalKicker}>PULL REQUEST</span>
         <h2 id="pr-metadata-title">Review pull request details</h2>
-        <p>The task agent read the current diff and drafted this metadata. The repository title format is enforced before the PR is created.</p>
+        <p>Drafted from the current diff. The repository title format is enforced before the PR is created. Choose draft or ready when you open it — the title and body are the same either way.</p>
         {pullRequestSetup.phase === "loading" && <p className={styles.commitScan}>● DRAFTING FROM CURRENT CHANGES…</p>}
         {pullRequestSetup.phase === "error" && <p className={styles.authError}>{pullRequestSetup.error}</p>}
         {pullRequestSetup.phase === "ready" && <><label>PR TITLE<input autoFocus value={pullRequestSetup.title} onChange={(event) => setPullRequestSetup({ ...pullRequestSetup, title: event.target.value })}/></label><label>DESCRIPTION<textarea value={pullRequestSetup.description} onChange={(event) => setPullRequestSetup({ ...pullRequestSetup, description: event.target.value })}/></label><DraftProvenance origin={pullRequestSetup}/></>}
-        <div className={styles.modalActions}><button disabled={!!busy} onClick={() => setPullRequestSetup(null)}>CANCEL</button><button disabled={pullRequestSetup.phase === "loading" || !!busy} onClick={() => preparePullRequest(pullRequestSetup.draft)}>{busy === "pr-metadata" ? "DRAFTING…" : "REGENERATE"}</button><button className={styles.primary} disabled={pullRequestSetup.phase !== "ready" || !pullRequestSetup.title.trim() || !pullRequestSetup.description.trim() || !!busy} onClick={async () => { if (await gitAction("pr", { draft: pullRequestSetup.draft, title: pullRequestSetup.title, description: pullRequestSetup.description })) setPullRequestSetup(null); }}>{busy === "pr" ? "OPENING…" : pullRequestSetup.draft ? "OPEN DRAFT PR" : "OPEN READY PR"}</button></div>
+        <div className={styles.modalActions}>
+          <button disabled={!!busy} onClick={() => setPullRequestSetup(null)}>CANCEL</button>
+          <button disabled={pullRequestSetup.phase === "loading" || !!busy} onClick={() => preparePullRequest()}>{busy === "pr-metadata" ? "DRAFTING…" : "REGENERATE"}</button>
+          {([{ draft: true, label: "OPEN AS DRAFT", busyLabel: "OPENING DRAFT…" }, { draft: false, label: "OPEN READY FOR REVIEW", busyLabel: "OPENING…" }] as const).map((mode) => <button
+            key={mode.label}
+            className={mode.draft ? "" : styles.primary}
+            disabled={pullRequestSetup.phase !== "ready" || !pullRequestSetup.title.trim() || !pullRequestSetup.description.trim() || !!busy}
+            onClick={async () => {
+              // Remembered so only the button that was pressed reports progress.
+              setPullRequestSetup({ ...pullRequestSetup, opening: mode.draft });
+              if (await gitAction("pr", { draft: mode.draft, title: pullRequestSetup.title, description: pullRequestSetup.description })) setPullRequestSetup(null);
+            }}
+          >{busy === "pr" && pullRequestSetup.opening === mode.draft ? mode.busyLabel : mode.label}</button>)}
+        </div>
       </section>
     </div>}
     {ignoredStagePrompt && <div className={styles.modalBackdrop} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setIgnoredStagePrompt(null); }}>
