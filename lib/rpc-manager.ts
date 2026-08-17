@@ -9,6 +9,7 @@ import { invalidateModelsCache } from "./models-cache";
 import { resolveVisibleModels, selectInitialModelScope } from "./model-scope";
 import { cacheSessionPath, invalidateSessionListCache } from "./session-reader";
 import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
+import { sprintPilotExtensionPath } from "./sprintpilot-extension-path";
 import { persistExplicitStartupPreferences } from "./startup-preferences";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
@@ -1609,10 +1610,17 @@ export async function startRpcSession(
     // Gate untrusted project extensions so opening a repository does not run
     // its .pi/extensions code automatically (see lib/project-trust.ts, #236).
     const trustReloadOptions = projectTrustReloadOptions(sessionCwd, agentDir);
+    // The bundled SprintPilot extension enforces the no-staging/committing/
+    // pushing boundary that SPRINTPILOT.md documents. It is loaded for every
+    // session and gates itself on the cwd being a SprintPilot worktree, so a
+    // session resumed later (for example by the commit-message route) is
+    // guarded exactly like the one that created it.
+    const sprintPilotExtension = sprintPilotExtensionPath();
     const services = await createAgentSessionServices({
       cwd: sessionCwd,
       agentDir,
       ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
+      ...(sprintPilotExtension ? { resourceLoaderOptions: { additionalExtensionPaths: [sprintPilotExtension] } } : {}),
     });
     const scope = await resolveVisibleModels(
       services.modelRuntime,

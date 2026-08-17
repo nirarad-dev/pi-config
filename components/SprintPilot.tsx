@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/cjs/styles/prism";
 import { completedStepsForJiraStatus, normalizeCompletedSteps, sortSprintTasks, SPRINT_TASK_GROUPS, sprintTaskGroup, TEST_PRESETS, WORKFLOW_STEPS, type ModelEntry, type SprintTask, type WorkflowStep } from "@/lib/sprintpilot-config";
+import { sprintPilotWorkflowPrompt } from "@/lib/sprintpilot-workflow-prompts";
 import { buildSprintPilotChangeTree, type SprintPilotChangeTreeNode } from "@/lib/sprintpilot-change-tree";
 import { parseDiff } from "@/lib/sprintpilot-diff";
 import type { SprintPilotHistoryLine } from "@/lib/sprintpilot-git-history";
@@ -88,19 +89,6 @@ const AGENT_STEPS: WorkflowStep[] = ["Plan", "Develop", "Pre-commit", "Deep revi
 const DEFAULT_PROVIDER = "anthropic";
 const DEFAULT_MODEL = "claude-opus-5";
 const DEFAULT_EFFORT = "medium";
-
-const actionPrompts: Record<string, (task: SprintTask) => string> = {
-  Plan: (task) => `Plan ${task.key}: ${task.summary}. Inspect the worktree and produce a phased implementation plan. Do not edit files, commit, or push.`,
-  Develop: (task) => `Implement ${task.key}: ${task.summary}. Follow the approved plan and repository guidance. Run focused checks, but do not stage, commit, push, or open a PR.`,
-  Test: (task) => `Start a fresh testing session for ${task.key}: ${task.summary}. Inspect the current changes and identify or run the most relevant focused tests. Do not stage, commit, push, or open a PR.`,
-  "Pre-commit": (task) => `Review the pending changes for ${task.key} before commit. Run the repository pre-commit checks and fix valid findings, but do not stage or commit anything.`,
-  Approve: (task) => `Review the pending changes for ${task.key} and provide an approval recommendation with any blocking findings. Do not stage, commit, push, or open a PR.`,
-  Commit: (task) => `Assess commit readiness for ${task.key}, summarize the exact intended files, and propose a commit message. Do not stage or commit anything.`,
-  Push: (task) => `Assess push readiness for ${task.key}, including branch state and required checks. Do not push or make any Git writes.`,
-  "Open PR": (task) => `Prepare a pull request title and description for ${task.key} from the current changes. Do not push or open the pull request.`,
-  "Deep review": (task) => `Deep-review the pending ${task.key} changes at standard depth. Pin the current head, review with structured and holistic passes, then debunk every finding. Report only validated findings. Do not post, commit, or push.`,
-  "PR review": (task) => `Run the PR-review workflow for ${task.key}: intake, triage, plan, then stop for approval before executing fixes. Preserve the workflow's hard approval gates. Do not commit, push, or post review replies without explicit approval.`,
-};
 
 function providerLabel(provider: string) {
   const value = provider.toLowerCase();
@@ -804,11 +792,12 @@ export function SprintPilot() {
   };
 
   const sendWorkflowPrompt = async (step: WorkflowStep) => {
-    if (!task || !state.worktree || !state.provider || !state.modelId || !actionPrompts[step]) return;
+    const prompt = task ? sprintPilotWorkflowPrompt(step, task) : undefined;
+    if (!task || !state.worktree || !state.provider || !state.modelId || !prompt) return;
     clearFinishedAlert(task.key);
     setBusy(step);
     try {
-      const sessionId = await queueTaskPrompt(actionPrompts[step](task));
+      const sessionId = await queueTaskPrompt(prompt);
       updateRuntime({ sessionId, completed: normalizeCompletedSteps(state.completed, [step]) });
       setNotice(`${step} sent to the task agent. It will run next if the agent is already busy.`);
     } catch (error) {
