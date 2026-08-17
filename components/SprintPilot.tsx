@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
-import { vscDarkPlus } from "react-syntax-highlighter/dist/cjs/styles/prism";
 import { completedStepsForJiraStatus, normalizeCompletedSteps, sortSprintTasks, SPRINT_TASK_GROUPS, sprintTaskGroup, TEST_PRESETS, WORKFLOW_STEPS, type ModelEntry, type SprintTask, type WorkflowStep } from "@/lib/sprintpilot-config";
 import { sprintPilotWorkflowPrompt } from "@/lib/sprintpilot-workflow-prompts";
 import { buildSprintPilotChangeTree, type SprintPilotChangeTreeNode } from "@/lib/sprintpilot-change-tree";
@@ -10,6 +9,7 @@ import { parseDiff } from "@/lib/sprintpilot-diff";
 import { annotateDiffLines, isFormattingOnlyHunk, type AnnotatedDiffLine } from "@/lib/sprintpilot-diff-intraline";
 import type { SprintPilotHistoryLine } from "@/lib/sprintpilot-git-history";
 import { sprintPilotDiffTokenStyles } from "@/lib/sprintpilot-highlight";
+import { cursorDarkPrismTheme } from "@/lib/sprintpilot-theme";
 import { buildReviewFixPrompt, type ReviewComment } from "@/lib/sprintpilot-review";
 import { sprintPilotDiffLanguage } from "@/lib/sprintpilot-syntax";
 import type { ProviderRateLimits, SprintPilotUsage } from "@/lib/sprintpilot-usage";
@@ -18,7 +18,7 @@ import { DirectoryPicker } from "./DirectoryPicker";
 import { FolderIcon, getFileIcon } from "./FileIcons";
 import styles from "./SprintPilot.module.css";
 
-const SPRINTPILOT_DIFF_THEME = { ...vscDarkPlus, ...sprintPilotDiffTokenStyles };
+const SPRINTPILOT_DIFF_THEME = { ...cursorDarkPrismTheme, ...sprintPilotDiffTokenStyles };
 const HISTORY_PAGE_SIZE = 200;
 
 type ModelResponse = {
@@ -250,8 +250,12 @@ function HighlightedDiffCode({ text, language }: { text: string; language?: stri
     PreTag="code"
     CodeTag="span"
     className={styles.diffSyntax}
-    customStyle={{ margin: 0, padding: 0, overflow: "visible", background: "transparent", font: "inherit", whiteSpace: "pre" }}
-    codeTagProps={{ style: { font: "inherit", whiteSpace: "inherit" } }}
+    // The theme carries its own font, line-height, and a 1px text shadow. Each is
+    // reset explicitly rather than relying on `font: inherit`, because any of
+    // them shifts the glyphs a pixel off the background layer underneath — and
+    // the shadow thickens every character on a dark ground.
+    customStyle={{ margin: 0, padding: 0, overflow: "visible", background: "transparent", font: "inherit", lineHeight: "inherit", fontFamily: "inherit", textShadow: "none", whiteSpace: "pre" }}
+    codeTagProps={{ style: { font: "inherit", lineHeight: "inherit", fontFamily: "inherit", textShadow: "none", whiteSpace: "inherit" } }}
   >{text || " "}</SyntaxHighlighter>;
 }
 
@@ -266,6 +270,11 @@ function HighlightedDiffCode({ text, language }: { text: string; language?: stri
  */
 function ChangeUnderlay({ line }: { line: AnnotatedDiffLine }) {
   if (line.kind === "context" || !line.segments.some((segment) => segment.changed)) return null;
+  // A wholly changed line has nothing to contrast against — a pure insertion or
+  // deletion has no counterpart — so the line background alone carries it.
+  // Drawing a word box there would end at the last character and break the
+  // continuous band that consecutive added lines should form.
+  if (line.segments.every((segment) => segment.changed)) return null;
   const tone = line.kind === "added" ? styles.wordAdded : styles.wordRemoved;
   const muted = line.formattingOnly ? styles.wordFormatting : "";
   return <span className={styles.changeUnderlay} aria-hidden="true">{line.segments.map((segment, index) =>

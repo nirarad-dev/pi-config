@@ -66,21 +66,43 @@ test("both layers share one padding box so the two stay aligned", () => {
   assert.match(css, /\.changeUnderlay\{[^}]*padding:0 14px 0 8px/);
 });
 
-test("word backgrounds stay clearly darker than the line they sit on", () => {
-  const alpha = (rule) => Number(css.match(rule)[1]);
-  const lineAdded = alpha(/\.line_added\{background:rgba\([\d,]+,\.(\d+)\)/);
-  const wordAdded = alpha(/\.wordAdded\{background:rgba\([\d,]+,\.(\d+)\)/);
-  const lineRemoved = alpha(/\.line_removed\{background:rgba\([\d,]+,\.(\d+)\)/);
-  const wordRemoved = alpha(/\.wordRemoved\{background:rgba\([\d,]+,\.(\d+)\)/);
-  assert.ok(wordAdded >= lineAdded + 10, `added tiers too close: ${lineAdded} vs ${wordAdded}`);
-  assert.ok(wordRemoved >= lineRemoved + 10, `removed tiers too close: ${lineRemoved} vs ${wordRemoved}`);
+test("the diff derives its add and remove colours from the Cursor Dark palette", () => {
+  // The published theme has no diff mapping, so these are its own green and red.
+  assert.match(css, /\.line_added\{background:#1b3626\}/);
+  assert.match(css, /\.line_removed\{background:#3a2630\}/);
+  // Consecutive changed lines must read as one band, not a stack of boxes.
+  assert.match(css, /\.codeLine\{min-width:max-content;width:100%\}/);
+  assert.match(css, /\.editorCode\{background:#141414/);
+  // Line text colour stays untinted so syntax highlighting reads normally.
+  assert.doesNotMatch(css, /\.line_added\{background:[^}]*;color:/);
+  assert.doesNotMatch(css, /\.line_removed\{background:[^}]*;color:/);
+});
+
+test("the syntax palette is Cursor Dark, including the added Python categories", () => {
+  assert.match(source, /\{ \.\.\.cursorDarkPrismTheme, \.\.\.sprintPilotDiffTokenStyles \}/);
+  assert.doesNotMatch(source, /vscDarkPlus|dracula/);
+  const theme = readFileSync(new URL("../lib/sprintpilot-theme.ts", import.meta.url), "utf8");
+  // The theme must not set font metrics or a text shadow: the diff paints word
+  // backgrounds on a layer beneath this text, and either would shift the glyphs.
+  assert.doesNotMatch(theme, /fontFamily|lineHeight|textShadow/);
+});
+
+test("word backgrounds stay clearly lighter than the line they sit on", () => {
+  const luma = (rule) => { const [, r, g, b] = css.match(rule).map((v, i) => i ? parseInt(v, 16) : v); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+  const hexRule = (name) => new RegExp(`\\.${name}\\{background:#(\\w\\w)(\\w\\w)(\\w\\w)`);
+  assert.ok(luma(hexRule("wordAdded")) - luma(hexRule("line_added")) > 15, "added tiers too close");
+  assert.ok(luma(hexRule("wordRemoved")) - luma(hexRule("line_removed")) > 15, "removed tiers too close");
+});
+
+test("a wholly changed line draws no word box, so insertions form one band", () => {
+  assert.match(source, /line\.segments\.every\(\(segment\) => segment\.changed\)\) return null/);
 });
 
 test("a formatting-only change is muted rather than coloured like a real edit", () => {
   // Covers a reindent and a rewrap alike: in both the code moved, not changed.
   assert.match(source, /line\.formattingOnly \? styles\.lineFormattingOnly : ""/);
   assert.match(source, /line\.formattingOnly \? styles\.wordFormatting : ""/);
-  assert.match(css, /\.lineFormattingOnly\.line_added\{background:rgba\([\d,]+,\.08\)\}/);
-  assert.match(css, /\.wordFormatting\{background:rgba\(125,131,140/);
+  assert.match(css, /\.lineFormattingOnly\.line_added\{background:#202020\}/);
+  assert.match(css, /\.wordFormatting\{background:#333333/);
   assert.match(source, /isFormattingOnlyHunk/);
 });

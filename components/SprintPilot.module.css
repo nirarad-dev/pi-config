@@ -69,7 +69,7 @@
 @media(max-width:1100px){.headerUsage .usageWindow{display:none}.headerUsage .claudeUsageBadge{min-width:126px}.headerUsage .rateLimitWeeklyOnly{min-width:82px}}
 @media(max-width:720px){.shell{padding-bottom:0}.topbar{display:grid;grid-template-columns:auto minmax(0,1fr) auto;height:auto;min-height:58px;padding:7px 10px;align-items:center}.brand small{display:none}.headerRight{display:contents}.headerUsage{grid-column:1/-1;grid-row:2;width:100%}.headerUsage .claudeUsageBadge{min-width:0;flex:1}.headerUsage .rateLimitWeeklyOnly{min-width:0}.providerMenu{grid-column:3;justify-self:end}.providerPopover{position:fixed;top:108px;right:8px;left:8px;width:auto}.usageBadge small{white-space:normal}}
 
-.changeLayout{grid-template-columns:320px minmax(0,1fr);height:560px;min-height:0;background:#090a0b}.fileExplorer{display:flex;min-width:0;min-height:0;flex-direction:column;border-right:1px solid #2a2e32;background:#0c0e10}.explorerHead{height:38px;display:flex;align-items:center;gap:8px;border-bottom:1px solid #272b2f;padding:0 12px;color:#aeb4ba;font-size:11px;font-weight:800;letter-spacing:.12em}.explorerHead b{margin-left:auto;min-width:22px;border-radius:9px;background:#252a2e;color:#b8bec4;font-size:10px;text-align:center}.fileList{min-height:0;flex:1;border:0;padding:5px;overflow:auto}.fileRow{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;border-left:2px solid transparent}.fileRow:hover{background:#14171a}.fileRow.activeFile{border-left-color:var(--cyan);background:#171a1e}.fileCheckbox{display:grid;place-items:center;cursor:pointer}.fileCheckbox input{width:14px;height:14px;margin:0;accent-color:var(--acid)}.fileRow button{width:100%;min-width:0;border:0;background:transparent;color:#d8dce0;font:inherit;display:grid;grid-template-columns:26px minmax(0,1fr) 22px;align-items:center;gap:7px;padding:7px 7px 7px 3px;text-align:left;cursor:pointer}.fileGlyph{width:22px;height:22px;display:grid;place-items:center;border-radius:3px;background:#162b32;color:#62dff5;font-size:8px;font-style:normal;font-weight:900}.fileIdentity{display:grid;min-width:0;line-height:1.3}.fileIdentity b{overflow:hidden;color:#dce0e4;font-size:12px;font-weight:600;text-overflow:ellipsis;white-space:nowrap}.fileIdentity small{overflow:hidden;color:#6f7780;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.fileRow em{font-size:11px;font-style:normal;font-weight:900;text-align:center}.status_M{color:#e5bd59}.status_A{color:#67d391}.status_D{color:#ef7272}.status_R{color:#bc8cff}.diffEditor{display:flex;min-width:0;min-height:0;flex-direction:column;background:#080a0c}.editorTab{height:38px;display:grid;grid-template-columns:22px auto minmax(0,1fr) auto;align-items:center;gap:7px;border-bottom:1px solid #272b2f;background:#101316;padding:0 12px}.editorTab b{color:#e1e5e8;font-size:12px;font-weight:600}.editorTab small{overflow:hidden;color:#68717a;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.editorTab em{color:#68717a;font-size:9px;font-style:normal;letter-spacing:.1em}.editorCode{min-height:0;flex:1;overflow:auto;padding-bottom:18px;scrollbar-gutter:stable}.diffHunk{min-width:max-content}.hunkHeader{position:sticky;left:0;display:flex;align-items:center;gap:9px;height:30px;border-top:1px solid #20323a;border-bottom:1px solid #20323a;background:#101b20;color:#83a9ba;font-size:11px;padding:0 12px}.hunkHeader span{color:#566d77}.codeLine{display:grid;grid-template-columns:48px 48px 24px minmax(max-content,1fr);min-height:22px;color:#c3c8cd;font-family:var(--font-mono);font-size:12px;line-height:22px;tab-size:4}.codeLine>span{user-select:none}.oldLine,.newLine{border-right:1px solid #202428;color:#59616a;text-align:right;padding-right:9px}.changeMark{text-align:center}.codeLine code{padding:0 14px 0 8px;color:inherit;font:inherit;white-space:pre}.line_added{background:rgba(56,139,80,.19);color:#c8e6cf}.line_added .changeMark{color:#63d17c;background:rgba(46,160,67,.14)}.line_removed{background:rgba(179,55,55,.18);color:#edc5c5}.line_removed .changeMark{color:#ee7777;background:rgba(218,54,51,.12)}.line_context:hover{background:#101316}.editorEmpty{min-height:100%;display:grid;place-content:center;justify-items:center;gap:7px;padding:30px;color:#737b83;text-align:center}.editorEmpty>span{color:#394149;font-size:34px}.editorEmpty b{color:#aab0b6;font-size:13px}.editorEmpty small{max-width:360px;font-size:11px;line-height:1.5}
+.changeLayout{grid-template-columns:320px minmax(0,1fr);height:560px;min-height:0;background:#090a0b}.fileExplorer{display:flex;min-width:0;min-height:0;flex-direction:column;border-right:1px solid #2a2e32;background:#0c0e10}.explorerHead{height:38px;display:flex;align-items:center;gap:8px;border-bottom:1px solid #272b2f;padding:0 12px;color:#aeb4ba;font-size:11px;font-weight:800;letter-spacing:.12em}.explorerHead b{margin-left:auto;min-width:22px;border-radius:9px;background:#252a2e;color:#b8bec4;font-size:10px;text-align:center}.fileList{min-height:0;flex:1;border:0;padding:5px;overflow:auto}.fileRow{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;border-left:2px solid transparent}.fileRow:hover{background:#14171a}.fileRow.activeFile{border-left-color:var(--cyan);background:#171a1e}.fileCheckbox{display:grid;place-items:center;cursor:pointer}.fileCheckbox input{width:14px;height:14px;margin:0;accent-color:var(--acid)}.fileRow button{width:100%;min-width:0;border:0;background:transparent;color:#d8dce0;font:inherit;display:grid;grid-template-columns:26px minmax(0,1fr) 22px;align-items:center;gap:7px;padding:7px 7px 7px 3px;text-align:left;cursor:pointer}.fileGlyph{width:22px;height:22px;display:grid;place-items:center;border-radius:3px;background:#162b32;color:#62dff5;font-size:8px;font-style:normal;font-weight:900}.fileIdentity{display:grid;min-width:0;line-height:1.3}.fileIdentity b{overflow:hidden;color:#dce0e4;font-size:12px;font-weight:600;text-overflow:ellipsis;white-space:nowrap}.fileIdentity small{overflow:hidden;color:#6f7780;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.fileRow em{font-size:11px;font-style:normal;font-weight:900;text-align:center}.status_M{color:#e5bd59}.status_A{color:#67d391}.status_D{color:#ef7272}.status_R{color:#bc8cff}.diffEditor{display:flex;min-width:0;min-height:0;flex-direction:column;background:#080a0c}.editorTab{height:38px;display:grid;grid-template-columns:22px auto minmax(0,1fr) auto;align-items:center;gap:7px;border-bottom:1px solid #272b2f;background:#101316;padding:0 12px}.editorTab b{color:#e1e5e8;font-size:12px;font-weight:600}.editorTab small{overflow:hidden;color:#68717a;font-size:10px;text-overflow:ellipsis;white-space:nowrap}.editorTab em{color:#68717a;font-size:9px;font-style:normal;letter-spacing:.1em}.editorCode{min-height:0;flex:1;overflow:auto;padding-bottom:18px;scrollbar-gutter:stable}.diffHunk{min-width:max-content}.hunkHeader{position:sticky;left:0;display:flex;align-items:center;gap:9px;height:30px;border-top:1px solid #20323a;border-bottom:1px solid #20323a;background:#101b20;color:#83a9ba;font-size:11px;padding:0 12px}.hunkHeader span{color:#566d77}.codeLine{display:grid;grid-template-columns:48px 48px 24px minmax(max-content,1fr);min-height:22px;color:#c3c8cd;font-family:var(--font-mono);font-size:12px;line-height:22px;tab-size:4}.codeLine>span{user-select:none}.oldLine,.newLine{border-right:1px solid #202428;color:#59616a;text-align:right;padding-right:9px}.changeMark{text-align:center}.codeLine code{padding:0 14px 0 8px;color:inherit;font:inherit;white-space:pre}.line_added .line_removed .line_context:hover{background:#101316}.editorEmpty{min-height:100%;display:grid;place-content:center;justify-items:center;gap:7px;padding:30px;color:#737b83;text-align:center}.editorEmpty>span{color:#394149;font-size:34px}.editorEmpty b{color:#aab0b6;font-size:13px}.editorEmpty small{max-width:360px;font-size:11px;line-height:1.5}
 
 @media(max-width:1000px){.changeLayout{height:auto;grid-template-columns:1fr}.fileExplorer{max-height:230px;border-right:0;border-bottom:1px solid #2a2e32}.diffEditor{height:480px}}
 @media(max-width:720px){.changeLayout{height:auto}.diffEditor{height:420px}.codeLine{grid-template-columns:38px 38px 22px minmax(max-content,1fr)}.editorTab small,.editorTab em{display:none}.editorTab{grid-template-columns:22px minmax(0,1fr)}}
@@ -145,28 +145,35 @@
 
 @media(max-width:1100px){.changeLayout{grid-template-columns:1fr}}
 
-/* Diff colouring, two intensities per side.
-   The line background says "this line is part of the change"; the darker word
-   background says "these are the characters that actually differ". Both are
-   desaturated so they sit behind the syntax colours rather than competing with
-   them, while the gap between the two tiers stays wide enough to read at a
-   glance. A line that only moved whitespace gets a muted version of both, so
-   reformatting reads as background noise instead of a real edit. */
-.line_added{background:rgba(120,175,130,.24);color:#c7cdc8}
-.line_removed{background:rgba(190,110,120,.24);color:#cfc8c9}
+/* Diff colouring, Cursor Dark.
+   Opaque rather than alpha-blended: the editor ground is a known #141414, so
+   stating the final colour directly gives the exact tone in the reference and
+   avoids a word background stacking on top of a line background to a shade
+   neither was chosen to produce.
+   Two tiers per side: the line background says "this line is part of the
+   change", the darker word background says "these characters actually differ".
+   Line text colour is deliberately not set — tinting it would fight the syntax
+   highlighting that survives on top of these backgrounds. */
+.editorCode{background:#141414;color:#d8dee9}
+/* Backgrounds span the full scroll width so consecutive changed lines read as
+   one band instead of a stack of boxes with dark gaps between them. */
+.codeLine{min-width:max-content;width:100%}
+.line_added{background:#1b3626}
+.line_removed{background:#3a2630}
 .codeCell{position:relative;display:block;min-width:0;padding:0 14px 0 8px}
 .changeUnderlay{position:absolute;top:0;left:0;right:0;bottom:0;padding:0 14px 0 8px;white-space:pre;color:transparent;pointer-events:none;overflow:hidden}
 .changeUnderlay mark{background:transparent;color:transparent;border-radius:2px}
-.wordAdded{background:rgba(90,180,115,.42)!important}
-.wordRemoved{background:rgba(200,105,115,.40)!important}
-/* Whitespace-only: quieter fill plus a dotted rule, so it is identifiable at a
-   glance without a character-substitution trick that would break alignment
-   between the underlay and the text above it. Covers a reindent and a rewrap
-   alike: both are the code being moved, not changed. */
-.lineFormattingOnly.line_added{background:rgba(120,175,130,.08)}
-.lineFormattingOnly.line_removed{background:rgba(190,110,120,.08)}
-.wordFormatting{background:rgba(125,131,140,.16)!important;border-bottom:1px dotted rgba(170,176,184,.45)}
-.lineFormattingOnly .changeMark{color:#8d969f;background:transparent}
-.hunkFormattingTag{margin-left:10px;font-style:normal;font-size:8px;font-weight:800;letter-spacing:.12em;color:#8d969f;border:1px solid #35393e;padding:2px 6px}
-.line_added .changeMark{color:#8cbd97;background:rgba(120,175,130,.14)}
-.line_removed .changeMark{color:#c99298;background:rgba(190,110,120,.14)}
+.wordAdded{background:#2d5a3d!important}
+.wordRemoved{background:#5c3141!important}
+/* Formatting-only borrows the palette's greys, the tones it already uses for
+   present-but-not-the-point text. Covers a reindent and a rewrap alike — in
+   both the code moved, not changed. */
+.lineFormattingOnly.line_added{background:#202020}
+.lineFormattingOnly.line_removed{background:#202020}
+.wordFormatting{background:#333333!important;border-bottom:1px dotted rgba(216,222,233,.30)}
+.lineFormattingOnly .changeMark{color:#6f6f6f;background:transparent}
+.hunkFormattingTag{margin-left:10px;font-style:normal;font-size:8px;font-weight:800;letter-spacing:.12em;color:#6f6f6f;border:1px solid #2a2a2a;padding:2px 6px}
+.line_added .changeMark{color:#a3be8c;background:transparent}
+.line_removed .changeMark{color:#bf616a;background:transparent}
+.hunkHeader{background:#1c1c1c;color:#6f6f6f}
+.oldLine,.newLine{color:#505050}
