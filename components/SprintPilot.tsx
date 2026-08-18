@@ -1081,7 +1081,7 @@ export function SprintPilot() {
     }
   };
 
-  const gitAction = async (action: "approve" | "commit" | "push" | "pr", extra: Record<string, unknown> = {}) => {
+  const gitAction = async (action: "commit" | "push" | "pr", extra: Record<string, unknown> = {}) => {
     if (!state.worktree || !task) return;
     setBusy(action);
     try {
@@ -1110,7 +1110,7 @@ export function SprintPilot() {
         else setNotice(`${result.url || "Pull request created"} · Jira Development verification unavailable${jiraState?.error ? `: ${jiraState.error}` : "."}`);
         return true;
       }
-      setNotice(result.url || result.output || (action === "approve" ? "Selection approved. The token expires in 30 minutes and becomes invalid if any selected file changes." : `${action} complete.`));
+      setNotice(result.url || result.output || `${action} complete.`);
       return true;
     } catch (error) { setNotice(error instanceof Error ? error.message : String(error)); return false; }
     finally { setBusy(null); }
