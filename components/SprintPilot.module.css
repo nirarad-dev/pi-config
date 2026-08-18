@@ -204,3 +204,10 @@
 .line_added .oldLine,.line_added .newLine{color:#7f9184}
 .line_removed .oldLine,.line_removed .newLine{color:#948084}
 .lineFormattingOnly .oldLine,.lineFormattingOnly .newLine{color:#6a6a6a}
+
+/* Ingest is asynchronous, so the operator needs to see that verification is
+   still running rather than assume the PR is linked because it exists. */
+.jiraWatchToast{position:fixed;bottom:72px;left:50%;transform:translateX(-50%);z-index:31;display:flex;align-items:center;gap:10px;border:1px solid #594617;background:#141106;color:#d4bd81;font-size:10px;letter-spacing:.06em;padding:9px 13px;max-width:min(92vw,760px)}
+.jiraWatchToast i{width:8px;height:8px;border-radius:50%;background:#ffd369;animation:agentAttentionPulse 1.4s ease-in-out infinite;flex:0 0 auto}
+.jiraWatchToast b{color:#ffd369}
+.jiraWatchToast a{color:var(--cyan);text-decoration:none;white-space:nowrap}

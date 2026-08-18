@@ -9,6 +9,8 @@ export type SprintPilotPullRequestMetadata = {
   description: string;
   generatedBy?: "agent" | "fallback";
   model?: SprintPilotMetadataModel;
+  /** Why the deterministic template was used, when it was. */
+  fallbackReason?: string;
 };
 export const ARNAC_AI_DISCLOSURE = "🤖 Generated with [Claude Code](https://claude.com/claude-code)";
 
@@ -17,12 +19,27 @@ export function sprintPilotJiraUrl(taskKey: string) {
   return `${baseUrl}/browse/${encodeURIComponent(taskKey)}`;
 }
 
+/**
+ * Write the ticket into the body's own Tickets section.
+ *
+ * The key goes in bare, on its own line, with the browse link beside it rather
+ * than wrapped around it. GitHub for Jira scrapes plain text: a key that exists
+ * only as a Markdown link target is the shape that produced a PR which looked
+ * correctly linked and never appeared in the Development panel.
+ *
+ * The existing heading is preserved verbatim, whichever spelling the template
+ * used. Rewriting `## Ticket(s)` to `## Tickets` would edit a heading a human
+ * may have already filled beneath.
+ */
 export function withLinkedSprintPilotTicket(description: string, taskKey: string) {
-  const ticketSection = /(^## Tickets\s*\n)[\s\S]*?(?=\n## |$)/im;
-  const linkedTicket = `- [${taskKey}](${sprintPilotJiraUrl(taskKey)})`;
+  // No `m` flag; see ticketsSection in sprintpilot-jira-keys. Under it the lazy
+  // body stops at the first line end, so replacing a multi-line section would
+  // leave its remaining lines stranded below the new entry.
+  const ticketSection = /((?:^|\n)## Ticket\(?s\)?[^\n]*\n)[\s\S]*?(?=\n## |$)/i;
+  const entry = `${taskKey}\n${sprintPilotJiraUrl(taskKey)}`;
   return ticketSection.test(description)
-    ? description.replace(ticketSection, `$1\n${linkedTicket}\n`)
-    : `${description.trim()}\n\n## Tickets\n\n${linkedTicket}\n`;
+    ? description.replace(ticketSection, `$1\n${entry}\n`)
+    : `${description.trim()}\n\n## Tickets\n\n${entry}\n`;
 }
 
 function fallbackTitle(component: string, taskKey: string, summary: string) {
@@ -82,7 +99,10 @@ export async function generateSprintPilotPullRequestMetadata(source: AgentSessio
     `Ticket summary: ${input.summary}`,
     `Jira details: ${input.taskDescription?.slice(0, 8_000) || "No additional Jira description was provided."}`,
     `The title MUST begin exactly "[${input.component}] [${input.taskKey}] " followed by a concise description.`,
-    `The Tickets section must contain exactly this Markdown link: [${input.taskKey}](${sprintPilotJiraUrl(input.taskKey)})`,
+    // Bare, not a Markdown link: GitHub for Jira scrapes plain text. The
+    // section is rewritten after parsing regardless, but an instruction asking
+    // for the shape that fails would be a contradiction left in the prompt.
+    `The Tickets section must contain the bare key ${input.taskKey} on its own line, not wrapped in a Markdown link.`,
     // Commit subjects carry the author's own narrative of the branch and cost a
     // few hundred tokens; the diff alone leaves the model to re-derive intent.
     input.commitSubjects?.length
@@ -91,10 +111,18 @@ export async function generateSprintPilotPullRequestMetadata(source: AgentSessio
     "Branch diff:",
     input.patch.slice(0, MAX_PATCH_LENGTH) || "(No branch diff was available; use the ticket details and commits.)",
   ].join("\n\n");
-  const { text, model } = await runSprintPilotMetadataAgent(source, {
-    systemPrompt: SYSTEM_PROMPT,
-    prompt,
-    timeoutMs: TIMEOUT_MS,
-  });
-  return { ...parseMetadata(text, fallback, input.taskKey), model };
+  // A timeout or an offline model must still leave a usable draft. Commit
+  // drafting has always fallen back to its deterministic template; this path
+  // only did so for unparseable output, so a slow model left the operator with
+  // an empty dialog and no way forward.
+  try {
+    const { text, model } = await runSprintPilotMetadataAgent(source, {
+      systemPrompt: SYSTEM_PROMPT,
+      prompt,
+      timeoutMs: TIMEOUT_MS,
+    });
+    return { ...parseMetadata(text, fallback, input.taskKey), model };
+  } catch (error) {
+    return { ...fallback, fallbackReason: error instanceof Error ? error.message : String(error) };
+  }
 }

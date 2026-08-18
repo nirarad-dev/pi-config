@@ -158,3 +158,23 @@ test("a formatting-only change is muted rather than coloured like a real edit", 
   assert.match(css, /\.wordFormatting\{border-bottom:1px dotted/);
   assert.match(source, /isFormattingOnlyHunk/);
 });
+
+test("creating a pull request is not reported as Jira having seen it", () => {
+  // Ingest is asynchronous: a check made the instant the PR exists says nothing.
+  assert.match(source, /const confirmJiraSeesPullRequest/);
+  assert.match(source, /action: "jira-development"/);
+  assert.match(source, /action: "jira-nudge"/);
+  assert.match(source, /Jira Development shows the pull request/);
+  assert.match(source, /Jira has NOT ingested this pull request/);
+});
+
+test("a commit that never mentioned the ticket is reported, not silently passed", () => {
+  assert.match(source, /commitCarriesKey === false/);
+  assert.match(source, /cannot be repaired now, only on the next branch/);
+});
+
+test("the operator can see that verification is still running", () => {
+  assert.match(source, /jiraWatchToast/);
+  assert.match(source, /waiting for Jira to ingest/);
+  assert.match(css, /\.jiraWatchToast\{position:fixed/);
+});

@@ -63,6 +63,10 @@ type AgentStatusSnapshot = {
 };
 type AgentRailStatus = "working" | "queued" | "needs-input" | "ready" | "idle";
 type PendingChanges = { changed: number; staged: number };
+type JiraDevelopment = { state: "linked" } | { state: "pending" } | { state: "unavailable"; error: string };
+/** Ingest normally lands in well under a minute; two matches the runbook. */
+const JIRA_INGEST_BUDGET_MS = 120_000;
+const JIRA_POLL_INTERVAL_MS = 10_000;
 type TaskRuntime = {
   worktree?: string;
   branch?: string;
@@ -91,6 +95,11 @@ const AGENT_STEPS: WorkflowStep[] = ["Plan", "Develop", "Pre-commit", "Deep revi
 const DEFAULT_PROVIDER = "anthropic";
 const DEFAULT_MODEL = "claude-opus-5";
 const DEFAULT_EFFORT = "medium";
+
+/** Browse URL for the watch banner; the server owns the canonical one. */
+function sprintPilotBrowseUrl(taskKey: string) {
+  return `https://fordefi.atlassian.net/browse/${encodeURIComponent(taskKey)}`;
+}
 
 function providerLabel(provider: string) {
   const value = provider.toLowerCase();
@@ -435,6 +444,7 @@ export function SprintPilot() {
   const [authSetup, setAuthSetup] = useState<AuthSetup | null>(null);
   const [pendingChanges, setPendingChanges] = useState<Record<string, PendingChanges>>({});
   const [ignoredStagePrompt, setIgnoredStagePrompt] = useState<{ files: string[]; message: string } | null>(null);
+  const [jiraWatch, setJiraWatch] = useState<{ taskKey: string; url: string; state: "waiting" | "nudging"; nudged: boolean } | null>(null);
   const [stagingTab, setStagingTab] = useState<"changes" | "staged">("changes");
   const [commitSetup, setCommitSetup] = useState<CommitSetup | null>(null);
   const [pullRequestSetup, setPullRequestSetup] = useState<PullRequestSetup | null>(null);
@@ -1081,11 +1091,85 @@ export function SprintPilot() {
     }
   };
 
+  /**
+   * Watch Jira until its Development panel actually shows the pull request.
+   *
+   * Creating a PR is not the same as Jira seeing it, and the difference is the
+   * whole failure: ingest is asynchronous, so a check made the instant the PR
+   * exists reports "pending" for a PR that will link fine, and reports nothing
+   * at all for one that never will. Neither "PR opened" nor "the ticket URL is
+   * in the body" is evidence, so the notice does not claim success until a
+   * pullrequest entry is really there.
+   */
+  const confirmJiraSeesPullRequest = async (taskKey: string, url: string, created: { jiraDevelopment?: JiraDevelopment; remoteLink?: { ok: boolean; error?: string }; commitCarriesKey?: boolean }) => {
+    const surfaces: string[] = [];
+    if (created.commitCarriesKey === false) surfaces.push(`no commit on this branch mentions ${taskKey} — that surface cannot be repaired now, only on the next branch`);
+    if (created.remoteLink && !created.remoteLink.ok) surfaces.push(`the Jira remote link was not created (${created.remoteLink.error})`);
+    const trailer = surfaces.length ? ` · ${surfaces.join("; ")}` : "";
+
+    if (created.jiraDevelopment?.state === "linked") {
+      setNotice(`${url} · Jira Development shows the pull request.${trailer}`);
+      return;
+    }
+    setJiraWatch({ taskKey, url, state: "waiting", nudged: false });
+
+    const deadline = Date.now() + JIRA_INGEST_BUDGET_MS;
+    let nudged = false;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, JIRA_POLL_INTERVAL_MS));
+      let development: JiraDevelopment | undefined;
+      try {
+        const poll = await jsonRequest<{ jiraDevelopment: JiraDevelopment }>("/api/sprintpilot/git", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "jira-development", cwd: state.worktree, taskKey }),
+        });
+        development = poll.jiraDevelopment;
+      } catch {
+        // A failed poll says nothing about ingest; keep waiting out the budget.
+        continue;
+      }
+      if (development.state === "linked") {
+        setJiraWatch(null);
+        setNotice(`${url} · Jira Development shows the pull request.${trailer}`);
+        return;
+      }
+      if (development.state === "unavailable") {
+        setJiraWatch(null);
+        setNotice(`${url} · Jira verification unavailable: ${development.error}.${trailer}`);
+        return;
+      }
+      // Halfway through the budget, give the integration something to react to.
+      if (!nudged && Date.now() > deadline - JIRA_INGEST_BUDGET_MS / 2) {
+        nudged = true;
+        setJiraWatch({ taskKey, url, state: "nudging", nudged: true });
+        try {
+          await jsonRequest("/api/sprintpilot/git", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "jira-nudge", cwd: state.worktree, taskKey, url }),
+          });
+        } catch {
+          // The nudge is best-effort; the poll below is what decides.
+        }
+        setJiraWatch({ taskKey, url, state: "waiting", nudged: true });
+      }
+    }
+    setJiraWatch(null);
+    setNotice(`${url} · Jira has NOT ingested this pull request after ${Math.round(JIRA_INGEST_BUDGET_MS / 60_000)} minutes${nudged ? ", including a bare-key comment" : ""}. Run the GitHub backfill in Jira, or close and reopen the PR.${trailer}`);
+  };
+
   const gitAction = async (action: "commit" | "push" | "pr", extra: Record<string, unknown> = {}) => {
     if (!state.worktree || !task) return;
     setBusy(action);
     try {
-      const result = await jsonRequest<{ approvalToken?: string; output?: string; url?: string; jiraDevelopment?: { state: "linked" | "pending" | "unavailable"; error?: string } }>("/api/sprintpilot/git", {
+      const result = await jsonRequest<{
+        approvalToken?: string;
+        output?: string;
+        url?: string;
+        taskKey?: string;
+        jiraDevelopment?: JiraDevelopment;
+        remoteLink?: { ok: boolean; error?: string };
+        commitCarriesKey?: boolean;
+      }>("/api/sprintpilot/git", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action, cwd: state.worktree, approvalToken: state.approvalToken, title: `${task.key}: ${task.summary}`, ...extra }),
       });
@@ -1104,10 +1188,7 @@ export function SprintPilot() {
       if (action === "push") updateRuntime({ completed: normalizeCompletedSteps(state.completed, ["Push"]) });
       if (action === "pr") {
         updateRuntime({ completed: normalizeCompletedSteps(state.completed, ["Open PR"]) });
-        const jiraState = result.jiraDevelopment;
-        if (jiraState?.state === "linked") setNotice(`${result.url || "Pull request created"} · Jira Development link confirmed.`);
-        else if (jiraState?.state === "pending") setNotice(`${result.url || "Pull request created"} · GitHub for Atlassian has not ingested the PR yet. If it remains missing, run the official GitHub backfill in Jira.`);
-        else setNotice(`${result.url || "Pull request created"} · Jira Development verification unavailable${jiraState?.error ? `: ${jiraState.error}` : "."}`);
+        void confirmJiraSeesPullRequest(String(result.taskKey || ""), String(result.url || ""), result);
         return true;
       }
       setNotice(result.url || result.output || `${action} complete.`);
@@ -1146,7 +1227,7 @@ export function SprintPilot() {
         body: JSON.stringify({ cwd: state.worktree, sessionId, taskKey: task.key, summary: task.summary, taskDescription: task.description }),
       });
       updateRuntime({ sessionId });
-      setPullRequestSetup({ phase: "ready", title: metadata.title, description: metadata.description, generatedBy: metadata.generatedBy, model: metadata.model });
+      setPullRequestSetup({ phase: "ready", title: metadata.title, description: metadata.description, generatedBy: metadata.generatedBy, model: metadata.model, fallbackReason: metadata.fallbackReason });
     } catch (error) {
       setPullRequestSetup({ phase: "error", title: "", description: "", error: error instanceof Error ? error.message : String(error) });
     } finally { setBusy(null); }
@@ -1484,6 +1565,11 @@ export function SprintPilot() {
           {authSetup.phase === "error" && <button className={styles.primary} onClick={() => connectProvider(authSetup.provider)}>TRY AGAIN</button>}
         </div>
       </section>
+    </div>}
+    {jiraWatch && <div className={styles.jiraWatchToast} role="status">
+      <i/>
+      <span><b>{jiraWatch.taskKey}</b> {jiraWatch.state === "nudging" ? "· posting a bare-key comment to prompt ingest…" : "· waiting for Jira to ingest the pull request…"}</span>
+      <a href={sprintPilotBrowseUrl(jiraWatch.taskKey)} target="_blank" rel="noreferrer">OPEN TICKET ↗</a>
     </div>}
     {(notice || busy) && <div className={styles.noticeToast} role="status"><span>{busy ? `● RUNNING ${busy.toUpperCase()}` : notice}</span>{notice && !busy && <button aria-label="Dismiss notification" onClick={() => setNotice("")}>×</button>}</div>}
   </main>;

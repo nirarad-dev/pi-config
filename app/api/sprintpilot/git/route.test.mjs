@@ -7,8 +7,9 @@ const route = readFileSync(new URL("./route.ts", import.meta.url), "utf8");
 test("pull-request creation enforces the repository title and description contract", () => {
   assert.match(route, /PR title must use the repository format: \[Component\] \[DEV-12345\] Short description/);
   assert.match(route, /description\.includes\("## Description"\)/);
-  assert.match(route, /description\.includes\("## Tickets"\)/);
-  assert.match(route, /PR Tickets must link to the Jira issue that appears in the title/);
+  // Both Tickets spellings are recognized, and the body's own heading is kept.
+  assert.match(route, /ticketsSection\(description\)/);
+  assert.match(route, /must contain \$\{taskKey\} as bare text/);
   assert.match(route, /checkSprintPilotPullRequestInJira/);
   assert.match(route, /PR title Jira key .* must match branch Jira key/);
   assert.match(route, /--assignee", "@me"/);
@@ -54,4 +55,36 @@ test("unstaging uses restore --staged and staging forces only on request", () =>
   assert.match(route, /body\.force === true \? \["-f"\] : \[\]/);
   assert.match(route, /ignored by one of your \\\.gitignore files/);
   assert.match(route, /ignored: true/);
+});
+
+test("the Tickets section must carry the key as bare text, not only a link", () => {
+  // The shape that produced a PR Jira never showed: the key existed only as a
+  // Markdown link target, which the text scraper does not reliably read.
+  assert.match(route, /hasBareJiraKey\(tickets, taskKey\)/);
+  assert.match(route, /A Markdown link alone is not read by GitHub for Jira/);
+});
+
+test("issue-key lookalikes in the title or branch are refused before creation", () => {
+  assert.match(route, /findStrayJiraKeys\(title, \[taskKey\]\)/);
+  assert.match(route, /findStrayJiraKeys\(branch, \[taskKey\]\)/);
+  assert.match(route, /latest_release_minus_1/);
+});
+
+test("an atlOrigin footer is never authored into the body", () => {
+  assert.match(route, /findInjectedJiraFooters\(description\)/);
+  assert.match(route, /adds that itself after ingest/);
+});
+
+test("creation reports the three scraped surfaces and links the ticket", () => {
+  // Branch and title are checked before the PR exists and can be refused; a
+  // commit message is history, so it is reported rather than repaired.
+  assert.match(route, /commitCarriesKey/);
+  assert.match(route, /createSprintPilotJiraRemoteLink\(taskKey, url, title\)/);
+});
+
+test("ingest is verified by polling, with a bare-key comment as the nudge", () => {
+  assert.match(route, /action === "jira-development"/);
+  assert.match(route, /action === "jira-nudge"/);
+  // The comment body is the bare key and nothing else.
+  assert.match(route, /"pr", "comment", url, "--body", taskKey/);
 });
